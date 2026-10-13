@@ -32,6 +32,8 @@ def test_shared_case(case):
     else:
         assert result is not None
         assert (result.key, result.kind) == (case["key"], case["kind"])
+        if "ambiguous" in case:
+            assert result.ambiguous is case["ambiguous"]
 
 
 def test_match_reports_provider():
@@ -97,6 +99,9 @@ BUNDLED_CASES = [
     ("gpt-4o-2099-01-01", "openai", "gpt-4o"),
     ("claude-sonnet-4-5", "anthropic", "claude-sonnet-4-5"),
     ("grok-4", "xai", "xai/grok-4"),
+    ("o1-mini-2024-09-12", "azure", "azure/o1-mini-2024-09-12"),
+    ("models/gemini-2.0-flash-001", "google_gemini", "gemini/gemini-2.0-flash-001"),
+    ("gemini-2.0-flash-001", "google_gemini", "gemini/gemini-2.0-flash-001"),
 ]
 
 
@@ -114,3 +119,11 @@ def test_bundled_snapshot_gemini_sdk_prefix():
 
     result = match_model("models/gemini-2.5-flash", BUNDLED_PRICING, "google_gemini")
     assert result is not None and result.key.rsplit("/", 1)[-1] == "gemini-2.5-flash"
+
+
+def test_bundled_snapshot_costs():
+    """1,000 input and 1,000 output tokens, priced from the vendor's own dated key."""
+    from traccia.processors.cost_engine import compute_cost
+
+    assert compute_cost("o1-mini-2024-09-12", 1000, 1000, vendor="azure") == 0.0055
+    assert compute_cost("models/gemini-2.0-flash-001", 1000, 1000, vendor="google_gemini") == 0.0005

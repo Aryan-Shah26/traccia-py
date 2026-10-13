@@ -2,13 +2,15 @@
 
 Names are compared by their base name: lower-cased, without the provider path
 (groq/openai/gpt-oss-120b -> gpt-oss-120b), a Bedrock region (us.), or a date or
--latest suffix. Among keys with the same base name, the span's vendor's own key wins,
-then the shortest key. A name with no matching base name gets no price.
+-latest suffix. Among keys with the same base name, the span's vendor's own key wins
+(its key for the exact dated version first), then the key for the exact name, then the
+shortest key. A name with no matching base name gets no price.
 
-Kept byte-identical in two repos, which both run tests/fixtures/pricing_match_cases.json:
+Kept identical in three repos, which all run tests/fixtures/pricing_match_cases.json:
 
     traccia-py                  pricing_matcher.py
     traccia-dashboard-service   app/services/pricing/matcher.py
+    traccia-node                src/processor/pricing-matcher.ts (port)
 """
 
 from __future__ import annotations
@@ -19,16 +21,33 @@ from typing import Any, Dict, List, Mapping, NamedTuple, Optional
 _REGION = re.compile(r"^(?:us|eu|apac|au|ca|jp|global|us-gov)\.")
 _SUFFIX = re.compile(r"(?:-\d{4}-\d{2}-\d{2}|-\d{8}|-latest)$")
 
+# llm.vendor values whose pricing providers have another name. Any other vendor is
+# its own provider family. A family is the provider of that name plus its variants
+# after "_" or "-": bedrock -> bedrock_converse, vertex_ai -> vertex_ai-language-models.
+_VENDOR_PROVIDERS = {
+    "openai": ("openai", "text-completion-openai"),
+    "azure_openai": ("azure",),
+    "google_gemini": ("gemini",),
+    "google": ("vertex_ai",),  # LangChain Vertex AI models
+    "aws": ("bedrock",),  # LangChain Bedrock models
+}
+
 
 class PriceMatch(NamedTuple):
     key: str
     kind: str  # exact | base
     provider: str  # pricing provider of the key ("" when unknown)
+    # A base match the vendor did not settle, among keys of several providers.
+    ambiguous: bool = False
+
+
+def _name(name: str) -> str:
+    """Lower-cased, without the provider path or region; the date is kept."""
+    return _REGION.sub("", name.strip().lower().rsplit("/", 1)[-1])
 
 
 def base_name(name: str) -> str:
-    name = name.strip().lower().rsplit("/", 1)[-1]
-    return _SUFFIX.sub("", _REGION.sub("", name))
+    return _SUFFIX.sub("", _name(name))
 
 
 def _provider(key: str, entry: Any) -> str:
@@ -36,6 +55,18 @@ def _provider(key: str, entry: Any) -> str:
     if not provider and "/" in key:
         provider = key.split("/", 1)[0]
     return (provider or "").lower()
+
+
+def _vendor_providers(vendor: Optional[str]) -> tuple:
+    v = str(vendor or "").strip().lower()
+    return _VENDOR_PROVIDERS.get(v, (v,)) if v else ()
+
+
+def _in_family(provider: str, families: tuple) -> bool:
+    return any(
+        provider == f or provider.startswith(f + "_") or provider.startswith(f + "-")
+        for f in families
+    )
 
 
 # The last table indexed, its size, and base name -> keys.
@@ -54,25 +85,37 @@ def _index(table: Mapping[str, Any]) -> Dict[str, List[str]]:
     return index
 
 
+def candidate_keys(model: Optional[str], table: Mapping[str, Any]) -> List[str]:
+    """Every key *model* could be priced from (all keys with its base name)."""
+    if not model or not table or not str(model).strip():
+        return []
+    base = base_name(str(model))
+    return list(_index(table).get(base, [])) if base else []
+
+
 def match_model(
     model: Optional[str],
     table: Mapping[str, Any],
     vendor: Optional[str] = None,
 ) -> Optional[PriceMatch]:
     """Return the pricing key for *model*, or None. *vendor* is the span's llm.vendor."""
-    if not model or not table or not str(model).strip():
-        return None
-    model = str(model)
-    if model in table:
-        return PriceMatch(model, "exact", _provider(model, table[model]))
-    keys = _index(table).get(base_name(model))
+    keys = candidate_keys(model, table)
     if not keys:
         return None
-    v = re.sub(r"[^a-z0-9]", "", (vendor or "").lower())
+    model = str(model)
+    wanted = _name(model)
+    providers = _vendor_providers(vendor)
 
     def own(key: str) -> bool:
-        p = re.sub(r"[^a-z0-9]", "", _provider(key, table[key]))
-        return bool(v and p) and (p.startswith(v) or v.startswith(p))
+        return _in_family(_provider(key, table[key]), providers)
 
-    key = min(keys, key=lambda k: (not own(k), len(k), k))
-    return PriceMatch(key, "base", _provider(key, table[key]))
+    # A dated version only beats the generic key among the vendor's own keys; a
+    # reseller's dated key is no better a guess than the shortest key.
+    key = min(
+        keys,
+        key=lambda k: (not own(k), k != model, not (own(k) and _name(k) == wanted), len(k), k),
+    )
+    if key == model:
+        return PriceMatch(key, "exact", _provider(key, table[key]))
+    ambiguous = not own(key) and len({_provider(k, table[k]) for k in keys}) > 1
+    return PriceMatch(key, "base", _provider(key, table[key]), ambiguous)
