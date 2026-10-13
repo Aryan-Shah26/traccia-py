@@ -269,6 +269,9 @@ class _StreamState:
     def _finish(self, exc: Optional[BaseException]) -> None:
         try:
             if exc is not None:
+                # Keep the text that arrived before the failure, as a stopped loop does.
+                if self.parts:
+                    self.span.set_attribute("llm.completion", "".join(self.parts))
                 _record_failure(self.span, exc, self.decision, self.model)
             else:
                 _record_result(
@@ -285,6 +288,21 @@ class _StreamState:
             pass
         finally:
             self.span.end()
+
+
+def _finish_abandoned(state: _StreamState) -> None:
+    """End the span of a stream dropped before it finished, off the collecting thread.
+
+    Finishing settles the reservation over HTTP, and __del__ runs on whichever thread
+    triggers garbage collection, possibly one running an event loop.
+    """
+    if state.done:
+        return
+    try:
+        threading.Thread(target=state.finish, name="traccia-groq-finish", daemon=True).start()
+    except RuntimeError:
+        # No new threads during interpreter shutdown; finish in place.
+        state.finish()
 
 
 class _SyncStream:
@@ -327,7 +345,7 @@ class _SyncStream:
     def __del__(self) -> None:
         # Abandoned before exhaustion or close(), e.g. `break` out of the loop.
         try:
-            self._state.finish()
+            _finish_abandoned(self._state)
         except Exception:
             pass
 
@@ -372,7 +390,78 @@ class _AsyncStream:
     def __del__(self) -> None:
         # Abandoned before exhaustion or close(), e.g. `break` out of the loop.
         try:
+            _finish_abandoned(self._state)
+        except Exception:
+            pass
+
+
+def _is_raw_response(resp: Any) -> bool:
+    """True for the APIResponse that with_raw_response / with_streaming_response return."""
+    return hasattr(resp, "http_response") and callable(getattr(resp, "parse", None))
+
+
+class _SyncRawStreamResponse:
+    """Proxy for the APIResponse of a raw streamed call; parse() returns the traced stream."""
+
+    def __init__(self, raw: Any, state: _StreamState) -> None:
+        self._raw, self._state = raw, state
+        self._stream: Optional[_SyncStream] = None
+
+    def parse(self, *args: Any, **kwargs: Any) -> Any:
+        if args or kwargs:  # parse(to=...) asks for another type; return it untraced
+            return self._raw.parse(*args, **kwargs)
+        if self._stream is None:
+            self._stream = _SyncStream(self._raw.parse(), self._state)
+        return self._stream
+
+    def close(self) -> None:
+        """Close the response and end the span (with_streaming_response's exit calls this)."""
+        try:
+            self._raw.close()
+        finally:
             self._state.finish()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+    def __del__(self) -> None:
+        # Dropped without parse(): the caller read the body itself or not at all.
+        try:
+            if self._stream is None:
+                _finish_abandoned(self._state)
+        except Exception:
+            pass
+
+
+class _AsyncRawStreamResponse:
+    """Proxy for the AsyncAPIResponse of a raw streamed call; parse() returns the traced stream."""
+
+    def __init__(self, raw: Any, state: _StreamState) -> None:
+        self._raw, self._state = raw, state
+        self._stream: Optional[_AsyncStream] = None
+
+    async def parse(self, *args: Any, **kwargs: Any) -> Any:
+        if args or kwargs:  # parse(to=...) asks for another type; return it untraced
+            return await self._raw.parse(*args, **kwargs)
+        if self._stream is None:
+            self._stream = _AsyncStream(await self._raw.parse(), self._state)
+        return self._stream
+
+    async def close(self) -> None:
+        """Close the response and end the span (with_streaming_response's exit calls this)."""
+        try:
+            await self._raw.close()
+        finally:
+            self._state.finish()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+    def __del__(self) -> None:
+        # Dropped without parse(): the caller read the body itself or not at all.
+        try:
+            if self._stream is None:
+                _finish_abandoned(self._state)
         except Exception:
             pass
 
@@ -403,6 +492,8 @@ def _wrap_sync(create_fn: Callable) -> Callable:
                 state = _StreamState(
                     span, kwargs.get("model"), t0, decision, contextvars.copy_context()
                 )
+                if _is_raw_response(resp):
+                    return _SyncRawStreamResponse(resp, state)
                 return _SyncStream(resp, state)
             _record_response(span, resp, kwargs.get("model"), t0, decision)
             span.end()
@@ -446,6 +537,8 @@ def _wrap_async(create_fn: Callable) -> Callable:
                 state = _StreamState(
                     span, kwargs.get("model"), t0, decision, contextvars.copy_context()
                 )
+                if _is_raw_response(resp):
+                    return _AsyncRawStreamResponse(resp, state)
                 return _AsyncStream(resp, state)
             _record_response(span, resp, kwargs.get("model"), t0, decision)
             span.end()

@@ -118,8 +118,8 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Write a haiku about Python"}],
 )
 
-# Streaming is traced too: the span stays open until the stream is read,
-# closed, or dropped, then records the full completion, tokens, and cost.
+# Streaming is traced too. Read to the end, the span records the full completion,
+# tokens, and cost. If you stop early, call stream.close() (or use with) to end it.
 stream = client.chat.completions.create(
     model="llama-3.3-70b-versatile",
     messages=[{"role": "user", "content": "Write a haiku about Python"}],
@@ -129,7 +129,7 @@ for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-Each call produces an `llm.groq.chat.completions` span. Calls made through `client.chat.completions.with_raw_response` are not traced.
+Each call produces an `llm.groq.chat.completions` span. Calls made through `client.chat.completions.with_raw_response` are traced too (a span, the prompt, and policy checks), but a regular call's response isn't parsed, so the span has no completion text or provider-reported usage. With `stream=True` (including `with_streaming_response`), the stream returned by `.parse()` is traced like any other.
 
 
 ### Load a versioned prompt

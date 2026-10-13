@@ -10,6 +10,8 @@ the installed groq package when it is available.
 import asyncio
 import gc
 import sys
+import threading
+import time
 import types
 
 import pytest
@@ -542,6 +544,12 @@ def test_async_stream_context_manager_closes_and_ends_span(monkeypatch, fake_tra
     assert fake_tracer.spans[-1].end_count == 1
 
 
+def _wait_for_end(span, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while not span.ended and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+
 def test_abandoned_stream_ends_span_on_gc(monkeypatch, fake_tracer):
     S, _ = _install_streaming(monkeypatch)
     stream = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
@@ -549,7 +557,26 @@ def test_abandoned_stream_ends_span_on_gc(monkeypatch, fake_tracer):
         break
     del stream
     gc.collect()
-    assert fake_tracer.spans[-1].end_count == 1
+    span = fake_tracer.spans[-1]
+    _wait_for_end(span)
+    assert span.end_count == 1
+    assert span.attributes["llm.completion"] == "Par"
+
+
+def test_abandoned_stream_settles_off_the_collecting_thread(monkeypatch, fake_tracer, pep):
+    _, calls = pep
+    threads = []
+    monkeypatch.setattr(
+        groq_mod, "_record_result", lambda *a, **kw: threads.append(threading.get_ident())
+    )
+    S, _ = _install_streaming(monkeypatch)
+    stream = S().create(model="m", messages=MSGS, stream=True)
+    for _ in stream:
+        break
+    del stream
+    gc.collect()
+    _wait_for_end(fake_tracer.spans[-1])
+    assert threads and threads[0] != threading.get_ident()
 
 
 def test_stream_error_mid_iteration(monkeypatch, fake_tracer):
@@ -559,6 +586,7 @@ def test_stream_error_mid_iteration(monkeypatch, fake_tracer):
         list(stream)
     span = fake_tracer.spans[-1]
     assert span.status == (SpanStatus.ERROR, "connection reset")
+    assert span.attributes["llm.completion"] == "Par"
     assert span.end_count == 1
 
 
@@ -767,3 +795,83 @@ def test_keyboard_interrupt_mid_stream_ends_span(monkeypatch, fake_tracer):
     span = fake_tracer.spans[-1]
     assert span.end_count == 1
     assert span.status == (SpanStatus.ERROR, "KeyboardInterrupt")
+
+
+# Raw responses (with_raw_response / with_streaming_response) of streamed calls
+
+
+class FakeRawResponse:
+    """groq's APIResponse: parse() returns the stream; http_response is the httpx response."""
+
+    def __init__(self, stream):
+        self._stream, self.http_response, self.closed = stream, "httpx-response", False
+        self.headers = {"x-ratelimit-remaining-requests": "99"}
+
+    def parse(self, **kw):
+        return self._stream
+
+    def close(self):
+        self.closed = True
+
+
+class FakeAsyncRawResponse(FakeRawResponse):
+    async def parse(self, **kw):
+        return self._stream
+
+    async def close(self):
+        self.closed = True
+
+
+def _install_raw_streaming(monkeypatch, chunks=CHUNKS):
+    S, A = _make_classes()
+    S.create = lambda self, **kw: FakeRawResponse(FakeStream(chunks))
+
+    async def acreate(self, **kw):
+        return FakeAsyncRawResponse(FakeAsyncStream(chunks))
+
+    A.create = acreate
+    _install_sdk(monkeypatch, S, A)
+    patch_groq()
+    return S, A
+
+
+def test_raw_streamed_call_traces_the_parsed_stream(monkeypatch, fake_tracer):
+    S, _ = _install_raw_streaming(monkeypatch)
+    raw = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
+    assert raw.headers["x-ratelimit-remaining-requests"] == "99"
+    span = fake_tracer.spans[-1]
+    assert not span.ended
+    stream = raw.parse()
+    assert raw.parse() is stream  # parsed once, like groq's cached parse()
+    assert "".join(c.choices[0].delta.content or "" for c in stream) == "Paris."
+    _assert_stream_span(span)
+
+
+def test_async_raw_streamed_call_traces_the_parsed_stream(monkeypatch, fake_tracer):
+    _, A = _install_raw_streaming(monkeypatch)
+
+    async def run():
+        raw = await A().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
+        return "".join([c.choices[0].delta.content or "" async for c in await raw.parse()])
+
+    assert asyncio.run(run()) == "Paris."
+    _assert_stream_span(fake_tracer.spans[-1])
+
+
+def test_raw_streamed_call_closed_without_parsing_ends_span(monkeypatch, fake_tracer):
+    S, _ = _install_raw_streaming(monkeypatch)
+    raw = S().create(model="m", messages=MSGS, stream=True)
+    raw.close()  # what with_streaming_response does on exit
+    assert raw._raw.closed
+    assert fake_tracer.spans[-1].end_count == 1
+
+
+def test_raw_streamed_call_dropped_without_parsing_ends_span(monkeypatch, fake_tracer):
+    S, _ = _install_raw_streaming(monkeypatch)
+    raw = S().create(model="m", messages=MSGS, stream=True)
+    del raw
+    gc.collect()
+    span = fake_tracer.spans[-1]
+    _wait_for_end(span)
+    assert span.end_count == 1
+
