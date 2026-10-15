@@ -1,572 +1,622 @@
-"""Groq monkey patching for chat.completions.create (sync, async and streaming)."""
+"""Groq (groq) monkey patching for chat.completions.create, sync and async.
+
+Patches ``Completions.create`` and ``AsyncCompletions.create`` so every call gets an
+``llm.groq.chat.completions`` span and goes through the governance policy check.
+
+- Streaming (``stream=True``): the returned ``Stream``/``AsyncStream`` is groq's own object.
+  Its iterator is wrapped, so the span stays open until the stream is read to the end,
+  stopped early, closed, fails, or is garbage collected, and then records the completion
+  and token usage.
+- ``with_raw_response`` keeps working: the parsed body is read through the response's own
+  cache, so the caller's ``parse()`` returns the same object.
+- Finalization (span attributes, governance settlement, metrics) runs in a copy of the
+  ``create()`` call's context, so it belongs to the agent and span that made the call,
+  whichever context consumes the stream.
+- Settlement charges the Spend Cap what the call cost: its priced token usage (at Groq's
+  price), an estimate when the response or stream was read but carried no usage, or the full
+  reservation when nothing of the response was read through the SDK. Only a call that failed
+  before any output releases its reservation. The settle request runs on a worker thread, so
+  a slow policy server does not delay the caller.
+"""
 
 from __future__ import annotations
 
 import contextvars
+import functools
 import json
+import math
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+import weakref
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from traccia.instrumentation.openai import _compute_cost, _safe_get
 from traccia.tracer.span import SpanStatus
 
 _patched = False
 
-_SPAN_NAME = "llm.groq.chat.completions"
+VENDOR = "groq"
+SPAN_NAME = "llm.groq.chat.completions"
+# groq sets this request header to "stream" for with_streaming_response, whose body the
+# caller reads; for with_raw_response it is "true" and the body is already read.
+_RAW_RESPONSE_HEADER = "X-Stainless-Raw-Response"
+_SUCCESS = "success"
+_ERROR = "error"
+_UNSET = object()
 
 
-def _get_tracer(name: str) -> Any:
-    """Return a tracer from the global provider."""
-    import traccia
+def _safe_get(obj: Any, path: str, default: Any = None) -> Any:
+    """Safely get a nested attribute or dict key (dot-separated path)."""
+    cur = obj
+    for part in path.split("."):
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            cur = getattr(cur, part, None)
+    return cur if cur is not None else default
 
-    return traccia.get_tracer(name)
+
+def _first_choice(obj: Any) -> Any:
+    choices = _safe_get(obj, "choices")
+    if isinstance(choices, (list, tuple)) and choices:
+        return choices[0]
+    return None
+
+
+def _read_tokens(usage: Any) -> Optional[Tuple[int, int, int]]:
+    """Prompt, completion and cached prompt token counts from a Groq usage object, if it has
+    prompt and completion counts. Cached tokens (``prompt_tokens_details.cached_tokens``,
+    billed at the cached input rate) are part of the prompt count; 0 when Groq reports none."""
+    prompt = _safe_get(usage, "prompt_tokens")
+    completion = _safe_get(usage, "completion_tokens")
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return None
+    if isinstance(prompt, bool) or isinstance(completion, bool):
+        return None
+    cached = _safe_get(usage, "prompt_tokens_details.cached_tokens")
+    if not isinstance(cached, int) or isinstance(cached, bool):
+        cached = 0
+    return prompt, completion, min(max(cached, 0), max(prompt, 0))
+
+
+def _output_chars(message: Any) -> int:
+    """Characters of output in a message or delta: its content plus tool call arguments."""
+    content = _safe_get(message, "content")
+    chars = len(content) if isinstance(content, str) else 0
+    tool_calls = _safe_get(message, "tool_calls")
+    if isinstance(tool_calls, (list, tuple)):
+        for call in tool_calls:
+            arguments = _safe_get(call, "function.arguments")
+            if isinstance(arguments, str):
+                chars += len(arguments)
+    return chars
 
 
 def _slim_messages(kwargs: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    """Return up to 50 messages reduced to role and string content."""
+    """JSON-friendly, small copies of the request messages."""
     messages = kwargs.get("messages")
     if not isinstance(messages, (list, tuple)):
         return None
-
     slim = []
-    for m in list(messages)[:50]:
-        if not isinstance(m, dict):
+    for message in list(messages)[:50]:
+        if not isinstance(message, dict):
             continue
-        content = m.get("content")
+        content = message.get("content")
         if content is not None and not isinstance(content, str):
             content = str(content)
-        slim.append({"role": m.get("role"), "content": content})
+        slim.append({"role": message.get("role"), "content": content})
     return slim or None
 
 
 def _prompt_text(slim: Optional[List[Dict[str, Any]]]) -> Optional[str]:
-    """Join slim messages into "role: content" lines."""
     if not slim:
         return None
-    parts = [
-        f"{m['role']}: {m['content']}" if m.get("role") else str(m["content"])
-        for m in slim
-        if m.get("content")
-    ]
-    return "\n".join(parts) or None
+    parts = []
+    for message in slim:
+        content = message.get("content")
+        if content:
+            role = message.get("role")
+            parts.append(f"{role}: {content}" if role else str(content))
+    return "\n".join(parts) if parts else None
 
 
-def _record_metrics(
-    model: Optional[str],
-    prompt_tokens: Optional[int],
-    completion_tokens: Optional[int],
-    duration: Optional[float],
-    cost: Optional[float],
-) -> None:
-    """Record LLM metrics if metrics are enabled."""
+def _request_attributes(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    attributes: Dict[str, Any] = {"llm.vendor": VENDOR}
+    model = kwargs.get("model")
+    if isinstance(model, str) and model:
+        attributes["llm.model"] = model
+    slim = _slim_messages(kwargs)
+    if slim:
+        try:
+            attributes["llm.groq.messages"] = json.dumps(slim)[:2000]
+        except Exception:
+            attributes["llm.groq.messages"] = str(slim)[:2000]
+    prompt = _prompt_text(slim)
+    if prompt:
+        attributes["llm.prompt"] = prompt
+    if kwargs.get("stream") is True:
+        attributes["llm.streaming"] = True
+    return attributes
+
+
+def _compute_cost(
+    model: Optional[str], prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0
+) -> Optional[float]:
+    """USD cost at Groq's price, or None when the pricing table has no Groq entry for the model
+    (the server then prices the tokens). Only Groq's own entries are used (see
+    cost_engine.STRICT_VENDORS), from the table spans are priced with, so the settled cost and
+    the span's llm.cost.usd agree. ``cached_tokens`` are part of ``prompt_tokens``."""
+    if not model:
+        return None
+    try:
+        from traccia.cost_resolver import get_resolver
+        from traccia.processors.cost_engine import compute_cost as _compute
+
+        return _compute(
+            model,
+            prompt_tokens - cached_tokens,
+            completion_tokens,
+            get_resolver().pricing_table,
+            cache_read_tokens=cached_tokens,
+            vendor=VENDOR,
+        )
+    except Exception:
+        return None
+
+
+def _metric_attributes(model: Optional[str]) -> Dict[str, Any]:
+    attributes: Dict[str, Any] = {"gen_ai.system": VENDOR}
+    if model:
+        attributes["gen_ai.request.model"] = model
+    try:
+        from traccia import runtime_config as _rc
+
+        agent_id = _rc.get_agent_id()
+        agent_name = _rc.get_agent_name()
+        env = _rc.get_env()
+        if agent_id:
+            attributes["agent.id"] = agent_id
+            attributes["agent_id"] = agent_id
+        if agent_name:
+            attributes["agent.name"] = agent_name
+        if env:
+            attributes["environment"] = env
+    except Exception:
+        pass
+    return attributes
+
+
+def _record_metrics(kind: str, model: Optional[str], tokens: Optional[Tuple[int, int, int]], duration: float, cost: Optional[float]) -> None:
+    """Token, duration, cost and exception metrics. Tokens and cost only from Groq's usage."""
     try:
         from traccia.metrics.recorder import get_metrics_recorder
 
         recorder = get_metrics_recorder()
         if not recorder:
             return
-
-        attrs: Dict[str, Any] = {"gen_ai.system": "groq"}
-        if model:
-            attrs["gen_ai.request.model"] = model
-
-        # Per-run agent identity, so ingestion attributes the data point to the right agent.
-        try:
-            from traccia import runtime_config as _rc
-
-            _aid = _rc.get_agent_id()
-            _aname = _rc.get_agent_name()
-            _env = _rc.get_env()
-            if _aid:
-                attrs["agent.id"] = _aid
-                attrs["agent_id"] = _aid
-            if _aname:
-                attrs["agent.name"] = _aname
-            if _env:
-                attrs["environment"] = _env
-        except Exception:
-            pass
-
-        if prompt_tokens is not None or completion_tokens is not None:
+        attributes = _metric_attributes(model)
+        if tokens:
             recorder.record_token_usage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                attributes=attrs,
+                prompt_tokens=tokens[0], completion_tokens=tokens[1], attributes=attributes
             )
-        if duration is not None:
-            recorder.record_duration(duration, attributes=attrs)
+        recorder.record_duration(duration, attributes=attributes)
         if cost is not None:
-            recorder.record_cost(cost, attributes=attrs)
+            recorder.record_cost(cost, attributes=attributes)
+        if kind == _ERROR:
+            recorder.record_exception(attributes=attributes)
     except Exception:
         pass
 
 
-def _start_attrs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the span attributes known before the call is made."""
-    slim = _slim_messages(kwargs)
-    attrs: Dict[str, Any] = {"llm.vendor": "groq"}
-    if kwargs.get("model"):
-        attrs["llm.model"] = kwargs["model"]
-    if slim:
-        attrs["llm.groq.messages"] = json.dumps(slim)[:1000]
-    text = _prompt_text(slim)
-    if text:
-        attrs["llm.prompt"] = text
-    return attrs
+class _CallState:
+    """Span and governance state for one create() call. Holds no reference to the stream,
+    so a stream's garbage-collection finalizer can hold it."""
 
+    def __init__(self, span: Any, kwargs: Dict[str, Any]) -> None:
+        self.span = span
+        self.decision: Optional[Dict[str, Any]] = None
+        # Context of the create() call: run identity, PEP flag, and this span as current.
+        self.ctx: Optional[contextvars.Context] = None
+        self.request_model: Optional[str] = None
+        self.prompt_tokens = _estimate_prompt_tokens(kwargs)
+        self._t0 = time.perf_counter()
+        # Reentrant: a garbage-collection finalizer can run on this thread mid-check.
+        self._lock = threading.RLock()
+        self._done = False
+        self._abandoned: Optional[weakref.finalize] = None
+        self._parts: List[str] = []
+        self._chars = 0
+        self._chunks = 0
+        self._usage: Any = None
+        self._resp_model: Any = None
+        self._finish_reason: Any = None
 
-def _first_choice(obj: Any) -> Any:
-    """Return choices[0] of a completion or chunk, or None."""
-    choices = _safe_get(obj, "choices")
-    return choices[0] if isinstance(choices, (list, tuple)) and choices else None
-
-
-def _record_result(
-    span: Any,
-    model: Optional[str],
-    resp_model: Optional[str],
-    usage: Any,
-    reason: Optional[str],
-    completion: Optional[str],
-    t0: float,
-    decision: Optional[Dict[str, Any]],
-) -> None:
-    """Set usage, finish reason and completion on the span, then record metrics and settle cost."""
-    from traccia.governance.pep import finish_llm_call
-
-    if resp_model and "llm.model" not in span.attributes:
-        span.set_attribute("llm.model", resp_model)
-
-    pt = ct = None
-    if usage:
-        span.set_attribute("llm.usage.source", "provider_usage")
-        pt = _safe_get(usage, "prompt_tokens")
-        ct = _safe_get(usage, "completion_tokens")
-        if pt is not None:
-            span.set_attribute("llm.usage.prompt_tokens", pt)
-            span.set_attribute("llm.usage.prompt_source", "provider_usage")
-        if ct is not None:
-            span.set_attribute("llm.usage.completion_tokens", ct)
-            span.set_attribute("llm.usage.completion_source", "provider_usage")
-        total = _safe_get(usage, "total_tokens")
-        if total is not None:
-            span.set_attribute("llm.usage.total_tokens", total)
-
-    if reason:
-        span.set_attribute("llm.finish_reason", reason)
-    if completion:
-        span.set_attribute("llm.completion", completion)
-
-    cost = _compute_cost(resp_model or model, pt, ct)
-    _record_metrics(resp_model or model, pt, ct, time.perf_counter() - t0, cost)
-    finish_llm_call(decision, actual_usd=cost)
-
-
-def _record_response(
-    span: Any,
-    resp: Any,
-    model: Optional[str],
-    t0: float,
-    decision: Optional[Dict[str, Any]],
-) -> None:
-    """Record a non-streamed ChatCompletion on the span."""
-    choice = _first_choice(resp)
-    _record_result(
-        span,
-        model,
-        _safe_get(resp, "model"),
-        _safe_get(resp, "usage"),
-        _safe_get(choice, "finish_reason"),
-        _safe_get(choice, "message.content"),
-        t0,
-        decision,
-    )
-
-
-def _record_failure(
-    span: Any,
-    exc: BaseException,
-    decision: Optional[Dict[str, Any]],
-    model: Optional[str],
-) -> None:
-    """Release the governance reservation and mark the span and metrics as failed."""
-    try:
-        from traccia.governance.pep import finish_llm_call
-
-        finish_llm_call(decision, release=True)
-    except Exception:
-        pass
-    span.record_exception(exc)
-    span.set_status(SpanStatus.ERROR, str(exc) or type(exc).__name__)
-    try:
-        from traccia.metrics.recorder import get_metrics_recorder
-
-        rec = get_metrics_recorder()
-        if rec:
-            rec.record_exception(
-                attributes={
-                    "gen_ai.system": "groq",
-                    "gen_ai.request.model": model or "unknown",
-                }
-            )
-    except Exception:
-        pass
-
-
-class _StreamState:
-    """Accumulates chunks of a streamed completion and closes the span exactly once."""
-
-    def __init__(
-        self,
-        span: Any,
-        model: Optional[str],
-        t0: float,
-        decision: Optional[Dict[str, Any]],
-        ctx: contextvars.Context,
-    ) -> None:
-        self.span, self.model, self.t0, self.decision = span, model, t0, decision
-        # The context of the create() call: agent identity, pep_enabled and this span
-        # as the current span. Finishing inside it settles and records metrics for the
-        # agent that made the call, wherever and whenever the stream is consumed.
-        self.ctx = ctx
-        self.parts: List[str] = []
-        self.resp_model = self.usage = self.reason = None
-        self.done = False
-        self._lock = threading.Lock()
+    # -- streams -------------------------------------------------------------
 
     def on_chunk(self, chunk: Any) -> None:
         """Collect content, finish reason and usage from one ChatCompletionChunk."""
+        self._chunks += 1
         try:
-            self.resp_model = self.resp_model or _safe_get(chunk, "model")
-            # Groq puts usage on the last chunk under x_groq.usage; chunk.usage is set
-            # instead when the caller passes stream_options={"include_usage": True}.
+            self._resp_model = self._resp_model or _safe_get(chunk, "model")
+            # Groq puts usage on the last chunk under x_groq.usage; chunk.usage is set instead
+            # with stream_options={"include_usage": True}.
             usage = _safe_get(chunk, "usage") or _safe_get(chunk, "x_groq.usage")
-            if usage:
-                self.usage = usage
+            if usage is not None:
+                self._usage = usage
             choice = _first_choice(chunk)
-            content = _safe_get(choice, "delta.content")
-            if content:
-                self.parts.append(content)
-            reason = _safe_get(choice, "finish_reason")
-            if reason:
-                self.reason = reason
+            delta = _safe_get(choice, "delta")
+            content = _safe_get(delta, "content")
+            if isinstance(content, str) and content:
+                self._parts.append(content)
+            self._chars += _output_chars(delta)
+            finish_reason = _safe_get(choice, "finish_reason")
+            if finish_reason:
+                self._finish_reason = finish_reason
         except Exception:
+            # Never let span bookkeeping break the caller's stream.
             pass
 
-    def finish(self, exc: Optional[BaseException] = None) -> None:
-        """Record what was streamed (or *exc*) and end the span; later calls do nothing."""
+    def trace_stream(self, stream: Any) -> None:
+        """Wrap a Stream so the span ends when the stream does."""
+        stream._iterator = _traced_iterator(stream._iterator, self)
+        original_close = stream.close
+
+        def close() -> None:
+            try:
+                original_close()
+            finally:
+                self.finalize(_SUCCESS)
+
+        stream.close = close
+        self._abandoned = weakref.finalize(stream, self.finalize, _SUCCESS)
+
+    def trace_async_stream(self, stream: Any) -> None:
+        """Wrap an AsyncStream so the span ends when the stream does."""
+        stream._iterator = _traced_async_iterator(stream._iterator, self)
+        original_close = stream.close
+
+        async def close() -> None:
+            try:
+                await original_close()
+            finally:
+                self.finalize(_SUCCESS)
+
+        stream.close = close
+        self._abandoned = weakref.finalize(stream, self.finalize, _SUCCESS)
+
+    # -- finalization --------------------------------------------------------
+
+    def finalize(self, kind: str, response: Any = _UNSET, error: Optional[BaseException] = None) -> None:
+        """Record the outcome, settle the reservation, record metrics, end the span.
+
+        Only the first call does anything. Never raises.
+        """
         with self._lock:
-            if self.done:
+            if self._done:
                 return
-            self.done = True
+            self._done = True
+        if self._abandoned is not None:
+            self._abandoned.detach()
+
+        def run() -> None:
+            self._finish(kind, response, error)
+
+        if self.ctx is None:
+            run()
+            return
         try:
-            self.ctx.run(self._finish, exc)
+            self.ctx.run(run)
         except RuntimeError:
-            # The context is already entered on this thread; finish in place.
-            self._finish(exc)
+            # The context is already entered on this thread; run in the current one.
+            run()
 
-    def _finish(self, exc: Optional[BaseException]) -> None:
+    def _finish(self, kind: str, response: Any, error: Optional[BaseException]) -> None:
+        span = self.span
         try:
-            if exc is not None:
-                # Keep the text that arrived before the failure, as a stopped loop does.
-                if self.parts:
-                    self.span.set_attribute("llm.completion", "".join(self.parts))
-                _record_failure(self.span, exc, self.decision, self.model)
+            if kind == _SUCCESS and response is not _UNSET:
+                choice = _first_choice(response)
+                message = _safe_get(choice, "message")
+                usage = _safe_get(response, "usage")
+                resp_model = _safe_get(response, "model")
+                chars = _output_chars(message)
+                read = True
+                content = _safe_get(message, "content")
+                completion = content if isinstance(content, str) else None
+                finish_reason = _safe_get(choice, "finish_reason")
             else:
-                _record_result(
-                    self.span,
-                    self.model,
-                    self.resp_model,
-                    self.usage,
-                    self.reason,
-                    "".join(self.parts) or None,
-                    self.t0,
-                    self.decision,
-                )
+                # A stream, or a call whose response was not read. After an error this keeps
+                # the text and any usage that arrived, as a stopped loop does.
+                usage = self._usage
+                resp_model = self._resp_model
+                chars = self._chars
+                read = self._chunks > 0
+                completion = "".join(self._parts) or None
+                finish_reason = self._finish_reason if kind == _SUCCESS else None
+
+            tokens = _read_tokens(usage)
+            self._record_span(tokens, usage, resp_model, completion, finish_reason)
+            if kind == _ERROR:
+                if error is not None:
+                    span.record_exception(error)
+                span.set_status(SpanStatus.ERROR, str(error) if error is not None else "error")
+
+            model = resp_model if isinstance(resp_model, str) and resp_model else self.request_model
+            settle = self._settlement(kind, tokens, model, chars, read)
+            _record_metrics(
+                kind,
+                model,
+                tokens,
+                time.perf_counter() - self._t0,
+                settle.get("actual_usd") if tokens else None,
+            )
+            try:
+                from traccia.governance.pep import finish_llm_call_in_background
+
+                # Started here, inside the call's context, so it settles for the agent and
+                # span that made the call.
+                finish_llm_call_in_background(self.decision, **settle)
+            except Exception:
+                pass
         except Exception:
+            # Recording is best-effort; the span still ends below.
             pass
         finally:
-            self.span.end()
+            try:
+                span.end()
+            except Exception:
+                pass
+
+    def _record_span(self, tokens, usage, resp_model, completion, finish_reason) -> None:
+        span = self.span
+        if isinstance(resp_model, str) and resp_model:
+            # The model Groq ran and billed, which settlement prices too, so the span's cost
+            # agrees with the settled cost. A different requested name is kept alongside.
+            requested = getattr(span, "attributes", {}).get("llm.model")
+            if requested and requested != resp_model:
+                span.set_attribute("llm.request.model", requested)
+            span.set_attribute("llm.model", resp_model)
+        if usage is not None:
+            span.set_attribute("llm.usage.source", "provider_usage")
+            if tokens:
+                # Prompt tokens are the uncached input, as the cost processor and the platform
+                # price them; cached input is priced at its own rate.
+                span.set_attribute("llm.usage.prompt_tokens", tokens[0] - tokens[2])
+                span.set_attribute("llm.usage.input_tokens", tokens[0] - tokens[2])
+                if tokens[2]:
+                    span.set_attribute("llm.usage.cache_read_tokens", tokens[2])
+                span.set_attribute("llm.usage.prompt_source", "provider_usage")
+                span.set_attribute("llm.usage.completion_tokens", tokens[1])
+                span.set_attribute("llm.usage.output_tokens", tokens[1])
+                span.set_attribute("llm.usage.completion_source", "provider_usage")
+            total = _safe_get(usage, "total_tokens")
+            if isinstance(total, int):
+                span.set_attribute("llm.usage.total_tokens", total)
+        if completion:
+            span.set_attribute("llm.completion", completion[:4096])
+        if finish_reason:
+            span.set_attribute("llm.finish_reason", str(finish_reason))
+
+    def _settlement(
+        self, kind: str, tokens: Optional[Tuple[int, int, int]], model: Optional[str], chars: int, read: bool
+    ) -> Dict[str, Any]:
+        """What to settle the reservation with. Groq bills the tokens it generated, also for
+        a stream that was stopped, closed or failed partway. ``read``: whether any of the
+        response reached the caller."""
+        if tokens:
+            return {
+                "actual_usd": _compute_cost(model, tokens[0], tokens[1], tokens[2]),
+                "model": model,
+                "vendor": VENDOR,
+                "input_tokens": tokens[0],
+                "output_tokens": tokens[1],
+            }
+        if read or chars > 0:
+            # The response was read but carried no usage (or the stream stopped before it):
+            # estimate the output from the text, at least one token, and the prompt from the
+            # request. The server prices the estimate, and only when both counts are present.
+            return {
+                "model": model,
+                "vendor": VENDOR,
+                "input_tokens": self.prompt_tokens or 0,
+                "output_tokens": max(math.ceil(chars / 4), 1),
+            }
+        if kind == _SUCCESS:
+            # The call completed but nothing of the response was read through the SDK, so its
+            # cost is unknown: charge the full reservation rather than nothing.
+            from traccia.governance.pep import reserved_usd
+
+            return {"actual_usd": reserved_usd(self.decision)}
+        return {"release": True}
 
 
-def _finish_abandoned(state: _StreamState) -> None:
-    """End the span of a stream dropped before it finished, off the collecting thread.
-
-    Finishing settles the reservation over HTTP, and __del__ runs on whichever thread
-    triggers garbage collection, possibly one running an event loop.
-    """
-    if state.done:
-        return
+def _estimate_prompt_tokens(kwargs: Dict[str, Any]) -> Optional[int]:
     try:
-        threading.Thread(target=state.finish, name="traccia-groq-finish", daemon=True).start()
-    except RuntimeError:
-        # No new threads during interpreter shutdown; finish in place.
-        state.finish()
+        from traccia.governance.pep import estimate_prompt_tokens
+
+        return estimate_prompt_tokens(kwargs)
+    except Exception:
+        return None
 
 
-class _SyncStream:
-    """Proxy for groq.Stream; records the span when the stream is exhausted, closed or dropped."""
+def _traced_iterator(inner: Any, state: _CallState):
+    """Record each chunk; finalize when the stream ends, fails, or is stopped early."""
+    try:
+        for chunk in inner:
+            state.on_chunk(chunk)
+            yield chunk
+    except GeneratorExit:
+        # The consumer stopped early (closed, or dropped the stream).
+        state.finalize(_SUCCESS)
+        raise
+    except BaseException as exc:
+        state.finalize(_ERROR, error=exc)
+        raise
+    state.finalize(_SUCCESS)
 
-    def __init__(self, stream: Any, state: _StreamState) -> None:
-        self._stream, self._state = stream, state
 
-    def __iter__(self) -> "_SyncStream":
-        return self
+async def _traced_async_iterator(inner: Any, state: _CallState):
+    """Async version of _traced_iterator."""
+    try:
+        async for chunk in inner:
+            state.on_chunk(chunk)
+            yield chunk
+    except GeneratorExit:
+        state.finalize(_SUCCESS)
+        raise
+    except BaseException as exc:
+        state.finalize(_ERROR, error=exc)
+        raise
+    state.finalize(_SUCCESS)
 
-    def __next__(self) -> Any:
+
+def _stream_classes() -> Tuple[type, ...]:
+    try:
+        from groq._streaming import AsyncStream, Stream
+
+        return Stream, AsyncStream
+    except Exception:
+        return ()
+
+
+def _response_classes() -> Tuple[type, ...]:
+    try:
+        from groq._response import APIResponse, AsyncAPIResponse
+
+        return APIResponse, AsyncAPIResponse
+    except Exception:
+        return ()
+
+
+def _is_streamed_response(resp: Any) -> bool:
+    """True for with_streaming_response, whose body the caller reads."""
+    try:
+        return resp.http_response.request.headers.get(_RAW_RESPONSE_HEADER) == "stream"
+    except Exception:
+        return False
+
+
+def _trace_result(resp: Any, state: _CallState) -> None:
+    """Finalize the span from a sync create() result, or keep it open for a stream."""
+    streams = _stream_classes()
+    responses = _response_classes()
+    if streams and isinstance(resp, streams):
+        state.trace_stream(resp)
+        return
+    if responses and isinstance(resp, responses):
+        if _is_streamed_response(resp):
+            state.finalize(_SUCCESS)
+            return
         try:
-            chunk = next(self._stream)
-        except StopIteration:
-            self._state.finish()
-            raise
-        except BaseException as exc:  # includes KeyboardInterrupt mid-stream
-            self._state.finish(exc)
-            raise
-        self._state.on_chunk(chunk)
-        return chunk
-
-    def __enter__(self) -> "_SyncStream":
-        return self
-
-    def __exit__(self, *exc_info: Any) -> None:
-        self.close()
-
-    def close(self) -> None:
-        """Close the underlying stream and end the span."""
-        try:
-            self._stream.close()
-        finally:
-            self._state.finish()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-    def __del__(self) -> None:
-        # Abandoned before exhaustion or close(), e.g. `break` out of the loop.
-        try:
-            _finish_abandoned(self._state)
+            parsed = resp.parse()  # cached by the response; the caller's parse() returns it
         except Exception:
-            pass
+            state.finalize(_SUCCESS)
+            return
+        _trace_result(parsed, state)
+        return
+    state.finalize(_SUCCESS, response=resp)
 
 
-class _AsyncStream:
-    """Proxy for groq.AsyncStream; records the span when the stream is exhausted, closed or dropped."""
-
-    def __init__(self, stream: Any, state: _StreamState) -> None:
-        self._stream, self._state = stream, state
-
-    def __aiter__(self) -> "_AsyncStream":
-        return self
-
-    async def __anext__(self) -> Any:
+async def _trace_async_result(resp: Any, state: _CallState) -> None:
+    """Async version of _trace_result."""
+    streams = _stream_classes()
+    responses = _response_classes()
+    if streams and isinstance(resp, streams):
+        state.trace_async_stream(resp)
+        return
+    if responses and isinstance(resp, responses):
+        if _is_streamed_response(resp):
+            state.finalize(_SUCCESS)
+            return
         try:
-            chunk = await self._stream.__anext__()
-        except StopAsyncIteration:
-            self._state.finish()
-            raise
-        except BaseException as exc:  # includes asyncio.CancelledError
-            self._state.finish(exc)
-            raise
-        self._state.on_chunk(chunk)
-        return chunk
-
-    async def __aenter__(self) -> "_AsyncStream":
-        return self
-
-    async def __aexit__(self, *exc_info: Any) -> None:
-        await self.close()
-
-    async def close(self) -> None:
-        """Close the underlying stream and end the span."""
-        try:
-            await self._stream.close()
-        finally:
-            self._state.finish()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-    def __del__(self) -> None:
-        # Abandoned before exhaustion or close(), e.g. `break` out of the loop.
-        try:
-            _finish_abandoned(self._state)
+            parsed = await resp.parse()
         except Exception:
-            pass
+            state.finalize(_SUCCESS)
+            return
+        await _trace_async_result(parsed, state)
+        return
+    state.finalize(_SUCCESS, response=resp)
 
 
-def _is_raw_response(resp: Any) -> bool:
-    """True for the APIResponse that with_raw_response / with_streaming_response return."""
-    return hasattr(resp, "http_response") and callable(getattr(resp, "parse", None))
+def _start(kwargs: Dict[str, Any]) -> Tuple[Any, _CallState, Any]:
+    """Start the span, make it current, and capture the call's context."""
+    from traccia.context import push_span
+
+    span = _get_tracer("groq").start_span(SPAN_NAME, attributes=_request_attributes(kwargs))
+    state = _CallState(span, kwargs)
+    token = push_span(span)
+    state.ctx = contextvars.copy_context()
+    return span, state, token
 
 
-class _SyncRawStreamResponse:
-    """Proxy for the APIResponse of a raw streamed call; parse() returns the traced stream."""
-
-    def __init__(self, raw: Any, state: _StreamState) -> None:
-        self._raw, self._state = raw, state
-        self._stream: Optional[_SyncStream] = None
-
-    def parse(self, *args: Any, **kwargs: Any) -> Any:
-        if args or kwargs:  # parse(to=...) asks for another type; return it untraced
-            return self._raw.parse(*args, **kwargs)
-        if self._stream is None:
-            self._stream = _SyncStream(self._raw.parse(), self._state)
-        return self._stream
-
-    def close(self) -> None:
-        """Close the response and end the span (with_streaming_response's exit calls this)."""
-        try:
-            self._raw.close()
-        finally:
-            self._state.finish()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._raw, name)
-
-    def __del__(self) -> None:
-        # Dropped without parse(): the caller read the body itself or not at all.
-        try:
-            if self._stream is None:
-                _finish_abandoned(self._state)
-        except Exception:
-            pass
+def _after_check(span: Any, state: _CallState, kwargs: Dict[str, Any]) -> None:
+    # The policy check may have swapped the model (reshape).
+    model = kwargs.get("model")
+    if isinstance(model, str) and model:
+        state.request_model = model
+        span.set_attribute("llm.model", model)
 
 
-class _AsyncRawStreamResponse:
-    """Proxy for the AsyncAPIResponse of a raw streamed call; parse() returns the traced stream."""
-
-    def __init__(self, raw: Any, state: _StreamState) -> None:
-        self._raw, self._state = raw, state
-        self._stream: Optional[_AsyncStream] = None
-
-    async def parse(self, *args: Any, **kwargs: Any) -> Any:
-        if args or kwargs:  # parse(to=...) asks for another type; return it untraced
-            return await self._raw.parse(*args, **kwargs)
-        if self._stream is None:
-            self._stream = _AsyncStream(await self._raw.parse(), self._state)
-        return self._stream
-
-    async def close(self) -> None:
-        """Close the response and end the span (with_streaming_response's exit calls this)."""
-        try:
-            await self._raw.close()
-        finally:
-            self._state.finish()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._raw, name)
-
-    def __del__(self) -> None:
-        # Dropped without parse(): the caller read the body itself or not at all.
-        try:
-            if self._stream is None:
-                _finish_abandoned(self._state)
-        except Exception:
-            pass
-
-
-def _wrap_sync(create_fn: Callable) -> Callable:
-    """Wrap Completions.create; returns *create_fn* unchanged if already wrapped."""
-    if getattr(create_fn, "_agent_trace_patched", False):
-        return create_fn
-
-    def wrapped(self, *args, **kwargs):
-        from traccia.context.context import pop_span, push_span
+def _build_sync_wrapper(original_create: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original_create)
+    def sync_wrapped(self, *args, **kwargs):
+        from traccia.context import pop_span
         from traccia.governance.pep import enforce_llm_call
 
-        t0 = time.perf_counter()
-        # Not a `with` block: a streamed call must keep the span open after we return.
-        span = _get_tracer("groq").start_span(
-            _SPAN_NAME, attributes=_start_attrs(kwargs)
-        )
-        token = push_span(span)
-        decision = None
+        span, state, token = _start(kwargs)
         try:
-            decision = enforce_llm_call(kwargs)
-            if kwargs.get("model"):
-                span.set_attribute("llm.model", kwargs["model"])
-            resp = create_fn(self, *args, **kwargs)
-            if kwargs.get("stream") is True:
-                span.set_attribute("llm.streaming", True)
-                state = _StreamState(
-                    span, kwargs.get("model"), t0, decision, contextvars.copy_context()
-                )
-                if _is_raw_response(resp):
-                    return _SyncRawStreamResponse(resp, state)
-                return _SyncStream(resp, state)
-            _record_response(span, resp, kwargs.get("model"), t0, decision)
-            span.end()
-            return resp
-        except BaseException as exc:
-            # BaseException, not Exception: asyncio.CancelledError and KeyboardInterrupt
-            # must also end the span and release the governance reservation.
-            _record_failure(span, exc, decision, kwargs.get("model"))
-            span.end()
-            raise
+            try:
+                state.decision = enforce_llm_call(kwargs, vendor=VENDOR)
+                _after_check(span, state, kwargs)
+                resp = original_create(self, *args, **kwargs)
+            except BaseException as exc:
+                state.finalize(_ERROR, error=exc)
+                raise
         finally:
             pop_span(token)
+        try:
+            _trace_result(resp, state)
+        except Exception:
+            state.finalize(_SUCCESS)
+        return resp
 
-    wrapped._agent_trace_patched = True
-    return wrapped
+    sync_wrapped._agent_trace_patched = True
+    return sync_wrapped
 
 
-def _wrap_async(create_fn: Callable) -> Callable:
-    """Wrap AsyncCompletions.create; returns *create_fn* unchanged if already wrapped."""
-    if getattr(create_fn, "_agent_trace_patched", False):
-        return create_fn
-
-    async def wrapped(self, *args, **kwargs):
-        from traccia.context.context import pop_span, push_span
+def _build_async_wrapper(original_create: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(original_create)
+    async def async_wrapped(self, *args, **kwargs):
+        from traccia.context import pop_span
         from traccia.governance.pep import enforce_llm_call
 
-        t0 = time.perf_counter()
-        # Not a `with` block: a streamed call must keep the span open after we return.
-        span = _get_tracer("groq").start_span(
-            _SPAN_NAME, attributes=_start_attrs(kwargs)
-        )
-        token = push_span(span)
-        decision = None
+        span, state, token = _start(kwargs)
         try:
-            decision = enforce_llm_call(kwargs)
-            if kwargs.get("model"):
-                span.set_attribute("llm.model", kwargs["model"])
-            resp = await create_fn(self, *args, **kwargs)
-            if kwargs.get("stream") is True:
-                span.set_attribute("llm.streaming", True)
-                state = _StreamState(
-                    span, kwargs.get("model"), t0, decision, contextvars.copy_context()
-                )
-                if _is_raw_response(resp):
-                    return _AsyncRawStreamResponse(resp, state)
-                return _AsyncStream(resp, state)
-            _record_response(span, resp, kwargs.get("model"), t0, decision)
-            span.end()
-            return resp
-        except BaseException as exc:
-            # BaseException, not Exception: asyncio.CancelledError and KeyboardInterrupt
-            # must also end the span and release the governance reservation.
-            _record_failure(span, exc, decision, kwargs.get("model"))
-            span.end()
-            raise
+            try:
+                state.decision = enforce_llm_call(kwargs, vendor=VENDOR)
+                _after_check(span, state, kwargs)
+                resp = await original_create(self, *args, **kwargs)
+            except BaseException as exc:
+                state.finalize(_ERROR, error=exc)
+                raise
         finally:
             pop_span(token)
+        try:
+            await _trace_async_result(resp, state)
+        except Exception:
+            state.finalize(_SUCCESS)
+        return resp
 
-    wrapped._agent_trace_patched = True
-    return wrapped
+    async_wrapped._agent_trace_patched = True
+    return async_wrapped
 
 
 def patch_groq() -> bool:
-    """
-    Patch Groq chat.completions.create for sync and async clients.
+    """Patch groq's chat.completions.create (sync and async). Returns True if patched.
 
-    Each call gets an ``llm.groq.chat.completions`` span with the prompt, completion,
-    token usage and cost. With ``stream=True`` the span stays open until the returned
-    stream is exhausted, closed or garbage collected.
-
-    Returns:
-        True if Groq is patched (now or by an earlier call), False if the groq
-        package is not installed.
+    Soft-fails (returns False) if groq isn't installed. Clients created before patching are
+    covered too; a ``with_raw_response``/``with_streaming_response`` accessor read before
+    patching keeps the unpatched method.
     """
     global _patched
     if _patched:
@@ -576,7 +626,19 @@ def patch_groq() -> bool:
     except Exception:
         return False
 
-    Completions.create = _wrap_sync(Completions.create)
-    AsyncCompletions.create = _wrap_async(AsyncCompletions.create)
-    _patched = True
-    return True
+    hit = False
+    for cls, build in ((Completions, _build_sync_wrapper), (AsyncCompletions, _build_async_wrapper)):
+        original = getattr(cls, "create", None)
+        if original is None:
+            continue
+        if not getattr(original, "_agent_trace_patched", False):
+            setattr(cls, "create", build(original))
+        hit = True
+    _patched = hit
+    return hit
+
+
+def _get_tracer(name: str):
+    import traccia
+
+    return traccia.get_tracer(name)

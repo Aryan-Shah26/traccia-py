@@ -20,7 +20,7 @@ Framework-agnostic and built for **OpenAI Agents, LangGraph, CrewAI, and LLM app
 
 ### Observability & Tracing
 
-- **Automatic Instrumentation**: Auto-patch OpenAI, Anthropic, Gemini (google-genai), Groq, requests, and HTTP libraries
+- **Automatic Instrumentation**: Auto-patch OpenAI, Anthropic, Gemini (google-genai), Groq (groq), requests, and HTTP libraries
 - **Framework Integrations**: Support for LangChain, CrewAI, and OpenAI Agents SDK
 - **LLM-Aware Tracing**: Track tokens, costs, prompts, completions, and latency automatically
 - **OpenTelemetry Metrics**: Emit OTEL-compliant metrics for accurate token and cost tracking independent of sampling
@@ -104,7 +104,7 @@ response = client.interactions.create(
 )
 ```
 
-### Groq
+### Groq (groq)
 
 ```python
 from traccia import init
@@ -118,18 +118,16 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Write a haiku about Python"}],
 )
 
-# Streaming is traced too. Read to the end, the span records the full completion,
-# tokens, and cost. If you stop early, call stream.close() (or use with) to end it.
-stream = client.chat.completions.create(
+# Streaming is traced too: the span stays open until the stream is read, closed, or dropped.
+for chunk in client.chat.completions.create(
     model="llama-3.3-70b-versatile",
     messages=[{"role": "user", "content": "Write a haiku about Python"}],
     stream=True,
-)
-for chunk in stream:
+):
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-Each call produces an `llm.groq.chat.completions` span. Calls made through `client.chat.completions.with_raw_response` are traced too (a span, the prompt, and policy checks), but a regular call's response isn't parsed, so the span has no completion text or provider-reported usage. With `stream=True` (including `with_streaming_response`), the stream returned by `.parse()` is traced like any other.
+Each call gets an `llm.groq.chat.completions` span and goes through the Spend Cap. Settlement charges Groq's reported usage at Groq's own price (cached prompt tokens at the cached rate); a stream stopped or failed partway is charged an estimate of what it produced; a `with_streaming_response` call, whose body you read yourself, is charged its full reservation. `with_raw_response` works as before. Calls made to Groq through the OpenAI client (`base_url="https://api.groq.com/openai/v1"`) go through the OpenAI integration instead, so use the `groq` client for Groq.
 
 
 ### Load a versioned prompt

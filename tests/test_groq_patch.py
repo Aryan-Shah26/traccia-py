@@ -1,55 +1,99 @@
 """
-Tests for instrumentation/groq.py's patch_groq() and span population.
+Tests for instrumentation/groq.py, against the real groq SDK.
 
-The Groq SDK is faked at sys.modules level (groq.resources.chat.completions
-.Completions / .AsyncCompletions) and the tracer is replaced with FakeTracer, so
-no network or real exporter is needed. test_real_sdk_gets_patched runs against
-the installed groq package when it is available.
+Only the HTTP layers are faked: Groq's API through an httpx.MockTransport, and the policy
+server through traccia.governance.pep._http_session. Spans come from a recording tracer.
 """
 
 import asyncio
 import gc
-import sys
-import threading
-import time
-import types
+import json
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from opentelemetry.trace import INVALID_SPAN_CONTEXT, NonRecordingSpan
 
-import instrumentation.groq as groq_mod
-from traccia.tracer.span import SpanStatus
-from instrumentation.groq import patch_groq
+groq = pytest.importorskip("groq")
+from groq import AsyncGroq, Groq  # noqa: E402
+from groq.resources.chat.completions import AsyncCompletions, Completions  # noqa: E402
+from opentelemetry.trace import INVALID_SPAN_CONTEXT  # noqa: E402
+
+import traccia.instrumentation.groq as groq_mod  # noqa: E402
+from traccia import runtime_config  # noqa: E402
+from traccia.governance.pep import estimate_prompt_tokens, flush_pending_settles  # noqa: E402
+from traccia.governance.policy import AgentBlockedError  # noqa: E402
+from traccia.instrumentation.groq import patch_groq  # noqa: E402
+from traccia.tracer.span import SpanStatus  # noqa: E402
+
+MODEL = "llama-3.3-70b-versatile"
+MESSAGES = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Capital of France?"}]
+# The prompt estimate sent with the policy check, used when Groq reports no usage.
+PROMPT_ESTIMATE = estimate_prompt_tokens({"messages": MESSAGES})
+USAGE = {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+RESERVED = 0.5
+COMPLETION = {
+    "id": "c1",
+    "object": "chat.completion",
+    "created": 1,
+    "model": MODEL,
+    "usage": USAGE,
+    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Paris."}}],
+}
 
 
-# Fakes: a tracer/span pair that records attributes and how often end() was called.
-# FakeSpan is an OTel span so opentelemetry.trace.get_current_span() returns it
-# while it is pushed as the current span.
-class FakeSpan(NonRecordingSpan):
-    def __init__(self):
-        super().__init__(INVALID_SPAN_CONTEXT)
-        self.attributes, self.exception, self.status = {}, None, None
-        self.end_count = 0
+def chunk(delta, finish_reason=None, **extra):
+    return {
+        "id": "c1",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": MODEL,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        **extra,
+    }
 
-    def set_attribute(self, k, v):
-        self.attributes[k] = v
+
+# Groq's stream shape: a role-only first chunk, and usage under x_groq on the last one.
+CHUNKS = [
+    chunk({"role": "assistant", "content": ""}, x_groq={"id": "req_1"}),
+    chunk({"content": "Par"}),
+    chunk({"content": "is."}),
+    chunk({}, "stop", x_groq={"id": "req_1", "usage": USAGE}),
+]
+
+
+def sse(chunks, error=None):
+    body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks)
+    if error:
+        body += f"data: {json.dumps({'error': {'message': error}})}\n\n"
+    return body + "data: [DONE]\n\n"
+
+
+# -- fakes -------------------------------------------------------------------------
+
+
+class FakeSpan:
+    def __init__(self, name, attributes):
+        self.name = name
+        self.attributes = dict(attributes or {})
+        self.ended = 0
+        self.status = None
+        self.exceptions = []
+
+    def set_attribute(self, key, value):
+        self.attributes[key] = value
 
     def record_exception(self, exc):
-        self.exception = exc
+        self.exceptions.append(exc)
 
-    def set_status(self, status, message=None):
-        self.status = (status, message)
+    def set_status(self, status, description=None):
+        self.status = (status, description)
 
     def end(self):
-        self.end_count += 1
+        self.ended += 1
 
-    # Lets the span be pushed as the current OTel span.
+    # Lets OpenTelemetry's context treat it as a (non-recording) current span.
     def get_span_context(self):
         return INVALID_SPAN_CONTEXT
-
-    @property
-    def ended(self):
-        return self.end_count > 0
 
 
 class FakeTracer:
@@ -57,821 +101,640 @@ class FakeTracer:
         self.spans = []
 
     def start_span(self, name, attributes=None):
-        span = FakeSpan()
-        span.attributes.update(attributes or {})
-        span.name = name
+        span = FakeSpan(name, attributes)
         self.spans.append(span)
         return span
 
 
+class PolicyServer:
+    """Fake policy server: records checks and settles."""
+
+    def __init__(self):
+        self.decision = {"effect": "allow", "would_have": False, "obligations": {"reserved_usd": RESERVED}}
+        self.checks = []
+        self._settles = []
+        self.session = MagicMock()
+        self.session.post.side_effect = self._post
+
+    @property
+    def settles(self):
+        """Settles received, after waiting for those still running in the background."""
+        flush_pending_settles()
+        return self._settles
+
+    def _post(self, url, **kwargs):
+        body = kwargs.get("json")
+        response = MagicMock(status_code=200)
+        if url.endswith("/check"):
+            self.checks.append(body)
+            response.json.return_value = self.decision
+        else:
+            self._settles.append(body)
+            response.json.return_value = {}
+        return response
+
+
+class GroqApi:
+    """Fake Groq HTTP API for httpx.MockTransport."""
+
+    def __init__(self):
+        self.status = 200
+        self.completion = COMPLETION
+        self.chunks = CHUNKS
+        self.stream_error = None
+        self.requests = []
+
+    def __call__(self, request):
+        body = json.loads(request.content)
+        self.requests.append(body)
+        if self.status != 200:
+            return httpx.Response(self.status, json={"error": {"message": "bad request"}})
+        if body.get("stream"):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse(self.chunks, self.stream_error),
+            )
+        return httpx.Response(200, json=self.completion)
+
+
+# -- fixtures ----------------------------------------------------------------------
+
+
 @pytest.fixture(autouse=True)
-def reset_state():
+def fresh_patch():
+    """Patch the real groq classes for each test, and restore them afterwards."""
+    originals = (Completions.create, AsyncCompletions.create)
     groq_mod._patched = False
     yield
+    Completions.create, AsyncCompletions.create = originals
     groq_mod._patched = False
 
 
 @pytest.fixture
-def fake_tracer(monkeypatch):
-    t = FakeTracer()
-    monkeypatch.setattr(groq_mod, "_get_tracer", lambda name: t)
-    return t
+def tracer(monkeypatch):
+    tracer = FakeTracer()
+    monkeypatch.setattr(groq_mod, "_get_tracer", lambda name: tracer)
+    return tracer
 
 
-def _fake_response(**kw):
-    d = dict(
-        model="llama-3.3-70b-versatile",
-        usage=types.SimpleNamespace(
-            prompt_tokens=11, completion_tokens=5, total_tokens=16
-        ),
-        choices=[
-            types.SimpleNamespace(
-                finish_reason="stop", message=types.SimpleNamespace(content="Paris.")
-            )
-        ],
+@pytest.fixture
+def server():
+    server = PolicyServer()
+    with patch("traccia.governance.pep._credentials", return_value=("key", "https://app.traccia.ai/v1/traces")):
+        with patch("traccia.governance.pep._http_session", server.session):
+            yield server
+
+
+@pytest.fixture
+def api():
+    return GroqApi()
+
+
+@pytest.fixture
+def client(api, tracer, server):
+    assert patch_groq()
+    return Groq(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(api)), max_retries=0)
+
+
+@pytest.fixture
+def async_client(api, tracer, server):
+    assert patch_groq()
+    return AsyncGroq(
+        api_key="test", http_client=httpx.AsyncClient(transport=httpx.MockTransport(api)), max_retries=0
     )
-    d.update(kw)
-    return types.SimpleNamespace(**d)
 
 
-def _make_classes():
-    class Completions:
-        def create(self, **kwargs):
-            self.last_kwargs = kwargs
-            return _fake_response()
-
-    class AsyncCompletions:
-        async def create(self, **kwargs):
-            self.last_kwargs = kwargs
-            return _fake_response()
-
-    return Completions, AsyncCompletions
+@pytest.fixture
+def governed():
+    with runtime_config.run_identity(agent_id="agent-a", pep_enabled=True):
+        yield
 
 
-def _install_sdk(monkeypatch, sync_cls, async_cls):
-    for name in ("groq", "groq.resources", "groq.resources.chat"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    mod = types.ModuleType("groq.resources.chat.completions")
-    mod.Completions, mod.AsyncCompletions = sync_cls, async_cls
-    monkeypatch.setitem(sys.modules, "groq.resources.chat.completions", mod)
+def priced(cost=pytest.approx(0.0000095, rel=0.1)):
+    return {
+        "actual_usd": cost,
+        "release": False,
+        "model": MODEL,
+        "vendor": "groq",
+        "input_tokens": 12,
+        "output_tokens": 3,
+    }
 
 
-MSGS = [{"role": "user", "content": "Capital of France?"}]
+def estimated(output_tokens, input_tokens=PROMPT_ESTIMATE):
+    return {
+        "actual_usd": None,
+        "release": False,
+        "model": MODEL,
+        "vendor": "groq",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
 
 
-# Patching and span population
-def test_patch_marks_both_classes(monkeypatch):
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
+def settle_fields(body):
+    keys = ("actual_usd", "release", "model", "vendor", "input_tokens", "output_tokens")
+    return {k: body.get(k) for k in keys}
+
+
+def create(client, **extra):
+    return client.chat.completions.create(model=MODEL, messages=MESSAGES, **extra)
+
+
+# -- patching ----------------------------------------------------------------------
+
+
+def test_patch_groq_wraps_sync_and_async_create_once():
     assert patch_groq() is True
-    assert S.create._agent_trace_patched and A.create._agent_trace_patched
+    sync_create, async_create = Completions.create, AsyncCompletions.create
+    assert sync_create._agent_trace_patched and async_create._agent_trace_patched
+    assert asyncio.iscoroutinefunction(async_create)
+    groq_mod._patched = False
+    assert patch_groq() is True
+    assert Completions.create is sync_create
+    assert AsyncCompletions.create is async_create
 
 
-def test_patch_returns_false_when_groq_missing(monkeypatch):
-    monkeypatch.setitem(sys.modules, "groq", None)
-    monkeypatch.setitem(sys.modules, "groq.resources.chat.completions", None)
+def test_patch_groq_soft_fails_without_groq(monkeypatch):
+    monkeypatch.setitem(__import__("sys").modules, "groq.resources.chat.completions", None)
     assert patch_groq() is False
 
 
-def test_double_patch_does_not_double_wrap(monkeypatch):
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    first = S.create
-    assert first._agent_trace_patched
-    groq_mod._patched = False
-    patch_groq()
-    assert S.create is first
+def test_auto_init_patches_groq():
+    import traccia.auto as auto
 
+    assert auto.patch_groq is patch_groq
 
-def test_sync_call_populates_span(monkeypatch, fake_tracer):
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    resp = S().create(model="llama-3.3-70b-versatile", messages=MSGS)
-    assert resp.choices[0].message.content == "Paris."
-    a = fake_tracer.spans[-1].attributes
-    assert fake_tracer.spans[-1].name == "llm.groq.chat.completions"
-    assert a["llm.vendor"] == "groq"
-    assert a["llm.model"] == "llama-3.3-70b-versatile"
-    assert a["llm.prompt"] == "user: Capital of France?"
-    assert a["llm.usage.prompt_tokens"] == 11
-    assert a["llm.usage.completion_tokens"] == 5
-    assert a["llm.usage.total_tokens"] == 16
-    assert a["llm.usage.source"] == "provider_usage"
-    assert a["llm.finish_reason"] == "stop"
-    assert a["llm.completion"] == "Paris."
 
+# -- non-streaming -----------------------------------------------------------------
 
-def test_async_call_populates_span(monkeypatch, fake_tracer):
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    asyncio.run(A().create(model="llama-3.3-70b-versatile", messages=MSGS))
-    a = fake_tracer.spans[-1].attributes
-    assert a["llm.usage.total_tokens"] == 16
-    assert a["llm.finish_reason"] == "stop"
-    assert a["llm.completion"] == "Paris."
 
+def test_completion_is_traced_checked_and_settled_with_its_cost(client, tracer, server, governed):
+    response = create(client)
 
-def test_positional_args_pass_through(monkeypatch, fake_tracer):
-    S, A = _make_classes()
-    S.create = lambda self, *args, **kw: (args, kw)
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    args, kw = S().create("pos", model="m", messages=MSGS)
-    assert args == ("pos",) and kw["model"] == "m"
-
-
-def test_exception_is_recorded_and_reraised(monkeypatch, fake_tracer):
-    S, A = _make_classes()
-
-    def boom(self, **kw):
-        raise RuntimeError("rate limited")
-
-    S.create = boom
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    with pytest.raises(RuntimeError):
-        S().create(model="m", messages=MSGS)
-    span = fake_tracer.spans[-1]
-    assert isinstance(span.exception, RuntimeError)
-    assert span.status == (SpanStatus.ERROR, "rate limited")
-
-
-def test_async_exception_is_recorded_and_reraised(monkeypatch, fake_tracer):
-    S, A = _make_classes()
-
-    async def boom(self, **kw):
-        raise RuntimeError("rate limited")
-
-    A.create = boom
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    with pytest.raises(RuntimeError):
-        asyncio.run(A().create(model="m", messages=MSGS))
-    span = fake_tracer.spans[-1]
-    assert isinstance(span.exception, RuntimeError)
-    assert span.status[0] == SpanStatus.ERROR
-
-
-def test_metrics_recorded(monkeypatch, fake_tracer):
-    import traccia.metrics.recorder as rec_mod
-
-    calls = {}
-
-    class Rec:
-        def record_token_usage(self, **kw):
-            calls["tokens"] = kw
-
-        def record_duration(self, d, **kw):
-            calls["duration"] = d
-
-        def record_cost(self, c, **kw):
-            calls["cost"] = (c, kw)
-
-        def record_exception(self, **kw):
-            calls["exception"] = kw
-
-    monkeypatch.setattr(rec_mod, "get_metrics_recorder", lambda: Rec())
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    S().create(model="llama-3.3-70b-versatile", messages=MSGS)
-    assert calls["tokens"]["prompt_tokens"] == 11
-    assert calls["tokens"]["completion_tokens"] == 5
-    assert calls["tokens"]["attributes"]["gen_ai.system"] == "groq"
-    assert calls["duration"] >= 0
-    assert calls["cost"][0] > 0
-
-
-def test_real_sdk_gets_patched(monkeypatch):
-    pytest.importorskip("groq")
-    from groq.resources.chat.completions import AsyncCompletions, Completions
-
-    monkeypatch.setattr(Completions, "create", Completions.create)
-    monkeypatch.setattr(AsyncCompletions, "create", AsyncCompletions.create)
-    assert patch_groq() is True
-    assert Completions.create._agent_trace_patched
-    assert AsyncCompletions.create._agent_trace_patched
-
-
-# Governance
-@pytest.fixture
-def pep(monkeypatch):
-    """Enable PEP and capture settle calls."""
-    from traccia import runtime_config
-    import traccia.governance.pep as pep_mod
-
-    calls = {"finish": []}
-    monkeypatch.setattr(
-        pep_mod,
-        "finish_llm_call",
-        lambda decision, **kw: calls["finish"].append((decision, kw)),
-    )
-    with runtime_config.run_identity(pep_enabled=True):
-        yield pep_mod, calls
-
-
-def test_deny_blocks_before_provider_call(monkeypatch, fake_tracer, pep):
-    from traccia.governance.policy import AgentBlockedError
-
-    pep_mod, _ = pep
-
-    def deny(**kw):
-        raise AgentBlockedError("budget exceeded")
-
-    monkeypatch.setattr(pep_mod, "check_policy", deny)
-    S, A = _make_classes()
-    called = []
-    orig = S.create
-    S.create = lambda self, **kw: called.append(1) or orig(self, **kw)
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    with pytest.raises(AgentBlockedError):
-        S().create(model="llama-3.3-70b-versatile", messages=MSGS)
-    assert called == []
-
-
-def test_reshape_swaps_model(monkeypatch, fake_tracer, pep):
-    pep_mod, _ = pep
-    monkeypatch.setattr(
-        pep_mod,
-        "check_policy",
-        lambda **kw: {
-            "effect": "reshape",
-            "would_have": False,
-            "obligations": {
-                "cheaper_model": "llama-3.1-8b-instant",
-                "clamp_max_tokens": 100,
-            },
-        },
-    )
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    inst = S()
-    inst.create(model="llama-3.3-70b-versatile", messages=MSGS)
-    assert inst.last_kwargs["model"] == "llama-3.1-8b-instant"
-    assert inst.last_kwargs["max_tokens"] == 100
-    assert fake_tracer.spans[-1].attributes["llm.model"] == "llama-3.1-8b-instant"
-
-
-def test_async_deny_blocks_before_provider_call(monkeypatch, fake_tracer, pep):
-    from traccia.governance.policy import AgentBlockedError
-
-    pep_mod, _ = pep
-
-    def deny(**kw):
-        raise AgentBlockedError("budget exceeded")
-
-    monkeypatch.setattr(pep_mod, "check_policy", deny)
-    S, A = _make_classes()
-    called = []
-
-    async def create(self, **kw):
-        called.append(1)
-
-    A.create = create
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    with pytest.raises(AgentBlockedError):
-        asyncio.run(A().create(model="llama-3.3-70b-versatile", messages=MSGS))
-    assert called == []
-
-
-def test_async_reshape_swaps_model(monkeypatch, fake_tracer, pep):
-    pep_mod, _ = pep
-    monkeypatch.setattr(
-        pep_mod,
-        "check_policy",
-        lambda **kw: {
-            "effect": "reshape",
-            "would_have": False,
-            "obligations": {"cheaper_model": "llama-3.1-8b-instant"},
-        },
-    )
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    inst = A()
-    asyncio.run(inst.create(model="llama-3.3-70b-versatile", messages=MSGS))
-    assert inst.last_kwargs["model"] == "llama-3.1-8b-instant"
-
-
-def test_failure_releases_reservation(monkeypatch, fake_tracer, pep):
-    pep_mod, calls = pep
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-    S, A = _make_classes()
-
-    def boom(self, **kw):
-        raise RuntimeError("x")
-
-    S.create = boom
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    with pytest.raises(RuntimeError):
-        S().create(model="m", messages=MSGS)
-    assert calls["finish"][-1][1].get("release") is True
-
-
-def test_success_settles_with_actual_cost(monkeypatch, fake_tracer, pep):
-    pep_mod, calls = pep
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    S().create(model="llama-3.3-70b-versatile", messages=MSGS)
-    assert calls["finish"][-1][1]["actual_usd"] > 0
-
-
-# Streaming
-def _chunk(content=None, finish_reason=None, usage=None, x_groq_usage=None):
-    return types.SimpleNamespace(
-        model="llama-3.3-70b-versatile",
-        choices=[
-            types.SimpleNamespace(
-                delta=types.SimpleNamespace(content=content),
-                finish_reason=finish_reason,
-            )
-        ],
-        usage=usage,
-        x_groq=types.SimpleNamespace(usage=x_groq_usage) if x_groq_usage else None,
-    )
-
-
-USAGE = types.SimpleNamespace(prompt_tokens=11, completion_tokens=5, total_tokens=16)
-CHUNKS = [
-    _chunk("Par"),
-    _chunk("is."),
-    _chunk(finish_reason="stop", x_groq_usage=USAGE),
-]
-
-
-class FakeStream:
-    def __init__(self, chunks, error=None):
-        self._chunks, self._error = list(chunks), error
-        self.closed = False
-        self.response = "raw-http-response"
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._chunks:
-            return self._chunks.pop(0)
-        if self._error:
-            raise self._error
-        raise StopIteration
-
-    def close(self):
-        self.closed = True
-
-
-class FakeAsyncStream:
-    def __init__(self, chunks, error=None):
-        self._chunks, self._error = list(chunks), error
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self._chunks:
-            return self._chunks.pop(0)
-        if self._error:
-            raise self._error
-        raise StopAsyncIteration
-
-    async def close(self):
-        self.closed = True
-
-
-def _install_streaming(monkeypatch, chunks=CHUNKS, error=None):
-    S, A = _make_classes()
-    S.create = lambda self, **kw: (
-        FakeStream(chunks, error) if kw.get("stream") else _fake_response()
-    )
-
-    async def acreate(self, **kw):
-        return FakeAsyncStream(chunks, error) if kw.get("stream") else _fake_response()
-
-    A.create = acreate
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    return S, A
-
-
-def _assert_stream_span(span):
+    assert response.choices[0].message.content == "Paris."
+    [span] = tracer.spans
+    assert span.name == "llm.groq.chat.completions"
+    assert span.ended == 1
     a = span.attributes
-    assert span.end_count == 1
-    assert a["llm.streaming"] is True
+    assert a["llm.vendor"] == "groq"
+    assert a["llm.model"] == MODEL
+    assert a["llm.prompt"] == "system: Be brief.\nuser: Capital of France?"
+    assert json.loads(a["llm.groq.messages"]) == MESSAGES
+    assert a["llm.usage.prompt_tokens"] == 12
+    assert a["llm.usage.completion_tokens"] == 3
+    assert a["llm.usage.total_tokens"] == 15
     assert a["llm.completion"] == "Paris."
     assert a["llm.finish_reason"] == "stop"
-    assert a["llm.usage.prompt_tokens"] == 11
-    assert a["llm.usage.completion_tokens"] == 5
-    assert a["llm.usage.total_tokens"] == 16
-    assert a["llm.usage.source"] == "provider_usage"
+    assert "llm.streaming" not in a
+    [check] = server.checks
+    assert check["context"]["vendor"] == "groq"
+    assert check["context"]["model"] == MODEL
+    [settle] = server.settles
+    assert settle["agent_id"] == "agent-a"
+    assert settle["reserved_usd"] == RESERVED
+    assert settle_fields(settle) == priced()
 
 
-def test_non_streaming_span_ends_once(monkeypatch, fake_tracer):
-    S, A = _make_classes()
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    S().create(model="llama-3.3-70b-versatile", messages=MSGS)
-    assert fake_tracer.spans[-1].end_count == 1
+def test_unpriced_model_sends_tokens_for_the_server_to_price(client, server, governed, monkeypatch):
+    monkeypatch.setattr(groq_mod, "_compute_cost", lambda *a: None)
+    create(client)
+    assert settle_fields(server.settles[0]) == priced(cost=None)
 
 
-def test_sync_stream_records_span_when_exhausted(monkeypatch, fake_tracer):
-    S, _ = _install_streaming(monkeypatch)
-    stream = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-    span = fake_tracer.spans[-1]
-    assert not span.ended  # still open until the caller consumes the stream
+def test_reshaped_model_is_sent_recorded_and_settled(client, api, tracer, server, governed):
+    server.decision = {
+        "effect": "reshape",
+        "would_have": False,
+        "obligations": {"reserved_usd": RESERVED, "cheaper_model": "llama-3.1-8b-instant"},
+    }
+    api.completion = {**COMPLETION, "model": None}
+    create(client)
+    assert api.requests[0]["model"] == "llama-3.1-8b-instant"
+    assert tracer.spans[0].attributes["llm.model"] == "llama-3.1-8b-instant"
+    assert server.settles[0]["model"] == "llama-3.1-8b-instant"
+
+
+def test_response_without_usage_settles_an_estimate(client, api, server, governed):
+    api.completion = {**COMPLETION, "usage": None}
+    create(client)
+    # 'Paris.' is 6 characters: 2 output tokens.
+    assert settle_fields(server.settles[0]) == estimated(2)
+
+
+def test_estimate_always_carries_input_tokens(client, api, server, governed):
+    # Without input_tokens the server would release the reservation instead of pricing it.
+    api.completion = {**COMPLETION, "usage": None}
+    client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": ""}])
+    assert settle_fields(server.settles[0]) == estimated(2, input_tokens=0)
+
+
+def test_tool_call_arguments_count_as_output(client, api, server, governed):
+    arguments = '{"city":"Paris","unit":"celsius"}'  # 33 characters: 9 tokens
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "weather", "arguments": arguments}}],
+    }
+    api.completion = {**COMPLETION, "usage": None, "choices": [{"index": 0, "finish_reason": "tool_calls", "message": message}]}
+    create(client)
+    assert settle_fields(server.settles[0]) == estimated(9)
+
+
+def test_http_error_releases_records_and_propagates(client, api, tracer, server, governed):
+    api.status = 400
+    with pytest.raises(groq.BadRequestError):
+        create(client)
+    [span] = tracer.spans
+    assert span.ended == 1
+    assert span.status[0] == SpanStatus.ERROR
+    assert isinstance(span.exceptions[0], groq.BadRequestError)
+    assert settle_fields(server.settles[0])["release"] is True
+
+
+def test_denied_call_never_reaches_groq(client, api, tracer, server, governed):
+    server.decision = {"id": "d1", "effect": "deny", "would_have": False, "reasons": ["spend cap"], "obligations": {}}
+    with pytest.raises(AgentBlockedError):
+        create(client)
+    assert api.requests == []
+    assert tracer.spans[0].ended == 1
+    assert tracer.spans[0].status[0] == SpanStatus.ERROR
+    assert server.settles == []  # nothing was reserved
+
+
+def test_ungoverned_call_is_traced_without_policy_calls(client, tracer, server):
+    create(client)
+    assert tracer.spans[0].ended == 1
+    assert server.checks == [] and server.settles == []
+
+
+def test_with_raw_response_keeps_parse_and_settles_once(client, tracer, server, governed):
+    raw = client.chat.completions.with_raw_response.create(model=MODEL, messages=MESSAGES)
+    parsed = raw.parse()
+    assert parsed.choices[0].message.content == "Paris."
+    assert raw.parse() is parsed
+    assert tracer.spans[0].ended == 1
+    assert [settle_fields(s) for s in server.settles] == [priced()]
+
+
+def test_with_streaming_response_charges_the_reservation_and_leaves_the_body(client, server, governed):
+    with client.chat.completions.with_streaming_response.create(model=MODEL, messages=MESSAGES) as response:
+        body = b"".join(response.iter_bytes())
+    assert json.loads(body)["choices"][0]["message"]["content"] == "Paris."
+    assert [settle_fields(s)["actual_usd"] for s in server.settles] == [RESERVED]
+
+
+def test_metrics_are_recorded_for_the_calling_agent(client, governed, monkeypatch):
+    recorder = MagicMock()
+    monkeypatch.setattr("traccia.metrics.recorder.get_metrics_recorder", lambda: recorder)
+    create(client)
+    attrs = recorder.record_token_usage.call_args.kwargs["attributes"]
+    assert attrs["gen_ai.system"] == "groq"
+    assert attrs["gen_ai.request.model"] == MODEL
+    assert attrs["agent.id"] == "agent-a"
+    assert recorder.record_token_usage.call_args.kwargs["prompt_tokens"] == 12
+    recorder.record_duration.assert_called_once()
+    recorder.record_cost.assert_called_once()
+    recorder.record_exception.assert_not_called()
+
+
+def test_a_failing_metrics_recorder_does_not_affect_the_call(client, server, governed, monkeypatch):
+    def broken():
+        raise RuntimeError("meter gone")
+
+    monkeypatch.setattr("traccia.metrics.recorder.get_metrics_recorder", broken)
+    assert create(client).choices[0].message.content == "Paris."
+    assert settle_fields(server.settles[0]) == priced()
+
+
+# -- streaming ---------------------------------------------------------------------
+
+
+def test_stream_read_to_the_end_is_priced_once(client, tracer, server, governed):
+    stream = create(client, stream=True)
+    assert tracer.spans[0].ended == 0
+    assert server.settles == []
     text = "".join(c.choices[0].delta.content or "" for c in stream)
+
     assert text == "Paris."
-    _assert_stream_span(span)
+    [span] = tracer.spans
+    assert span.ended == 1
+    assert span.attributes["llm.streaming"] is True
+    assert span.attributes["llm.completion"] == "Paris."
+    assert span.attributes["llm.finish_reason"] == "stop"
+    assert span.attributes["llm.usage.total_tokens"] == 15
+    assert span.status is None
+    assert [settle_fields(s) for s in server.settles] == [priced()]
 
 
-def test_async_stream_records_span_when_exhausted(monkeypatch, fake_tracer):
-    _, A = _install_streaming(monkeypatch)
+def test_stream_with_include_usage_is_priced(client, api, server, governed):
+    api.chunks = [chunk({"content": "Paris."}, "stop"), {**chunk({}), "choices": [], "usage": USAGE}]
+    # groq's Python SDK has no stream_options parameter; it is passed through extra_body.
+    for _ in create(client, stream=True, extra_body={"stream_options": {"include_usage": True}}):
+        pass
+    assert [settle_fields(s) for s in server.settles] == [priced()]
 
+
+def test_stream_next_is_traced(client, server, governed):
+    stream = create(client, stream=True)
+    while True:
+        try:
+            next(stream)
+        except StopIteration:
+            break
+    assert [settle_fields(s) for s in server.settles] == [priced()]
+
+
+def test_stream_closed_early_settles_what_was_streamed(client, tracer, server, governed):
+    stream = create(client, stream=True)
+    for c in stream:
+        if c.choices[0].delta.content:
+            break
+    stream.close()
+    assert tracer.spans[0].ended == 1
+    assert tracer.spans[0].attributes["llm.completion"] == "Par"
+    # 'Par' is 1 token; Groq bills what it generated.
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
+
+
+def test_stream_context_manager_exit_finalizes(client, server, governed):
+    with create(client, stream=True) as stream:
+        next(iter(stream))
+    assert len(server.settles) == 1
+    assert server.settles[0]["release"] is False
+
+
+def test_stream_dropped_unread_charges_the_reservation(client, tracer, server, governed):
+    stream = create(client, stream=True)
+    del stream
+    gc.collect()
+    assert tracer.spans[0].ended == 1
+    assert [settle_fields(s)["actual_usd"] for s in server.settles] == [RESERVED]
+
+
+def test_stream_dropped_mid_read_settles_what_was_streamed(client, server, governed):
+    stream = create(client, stream=True)
+    it = iter(stream)
+    next(it)
+    next(it)  # 'Par'
+    del it, stream
+    gc.collect()
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
+
+
+def test_error_mid_stream_settles_what_was_streamed_and_propagates(client, api, tracer, server, governed):
+    api.chunks = CHUNKS[:2]
+    api.stream_error = "connection reset"
+    with pytest.raises(groq.APIError):
+        for _ in create(client, stream=True):
+            pass
+    [span] = tracer.spans
+    assert span.ended == 1
+    assert span.status[0] == SpanStatus.ERROR
+    assert span.attributes["llm.completion"] == "Par"
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
+
+
+def test_error_before_any_chunk_releases(client, api, server, governed):
+    api.chunks = []
+    api.stream_error = "overloaded"
+    with pytest.raises(groq.APIError):
+        for _ in create(client, stream=True):
+            pass
+    assert settle_fields(server.settles[0])["release"] is True
+
+
+def test_error_after_the_role_chunk_settles_a_one_token_estimate(client, api, server, governed):
+    # Groq had started the completion, so it is billed: never release it.
+    api.chunks = CHUNKS[:1]
+    api.stream_error = "overloaded"
+    with pytest.raises(groq.APIError):
+        for _ in create(client, stream=True):
+            pass
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
+
+
+def test_stream_stopped_on_the_role_chunk_settles_an_estimate_not_the_reservation(client, server, governed):
+    stream = create(client, stream=True)
+    for _ in stream:
+        break
+    stream.close()
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
+
+
+def test_stream_that_ended_without_output_or_usage_settles_a_one_token_estimate(client, api, server, governed):
+    api.chunks = [chunk({}, "stop")]
+    for _ in create(client, stream=True):
+        pass
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
+
+
+def test_settle_runs_in_the_background(client, server, governed, monkeypatch):
+    import threading
+
+    from traccia.governance import pep
+
+    gate = threading.Event()
+    original = pep.finish_llm_call
+
+    def slow_finish(*args, **kwargs):
+        gate.wait(5)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(pep, "finish_llm_call", slow_finish)
+    assert create(client).choices[0].message.content == "Paris."
+    assert server._settles == []  # the caller got its data before the settle finished
+    gate.set()
+    assert [settle_fields(s) for s in server.settles] == [priced()]
+
+
+def use_pricing(monkeypatch, table):
+    """Make *table* the process pricing table, as start_tracing() does."""
+    from traccia.cost_resolver import CostResolver
+
+    monkeypatch.setattr("traccia.cost_resolver._resolver", CostResolver(table, "override"))
+
+
+def test_groq_price_is_never_another_providers(monkeypatch):
+    use_pricing(monkeypatch, {
+        "groq/llama-3.3-70b-versatile": {"prompt": 0.00059, "completion": 0.00079, "_provider": "groq"},
+        "groq/openai/gpt-oss-120b": {"prompt": 0.00015, "completion": 0.0006, "_provider": "groq"},
+        "fireworks_ai/accounts/fireworks/models/gemma2-9b-it": {"prompt": 0.0002, "completion": 0.0002, "_provider": "fireworks_ai"},
+        "openai/gpt-oss-120b": {"prompt": 0.01, "completion": 0.01, "_provider": "openrouter"},
+        "ovhcloud/Qwen3-32B": {"prompt": 0.00008, "completion": 0.00023, "_provider": "ovhcloud"},
+        "groq/qwen/qwen3-32b": {"prompt": 0.00029, "completion": 0.00059, "_provider": "groq"},
+    })
+    assert groq_mod._compute_cost("llama-3.3-70b-versatile", 1000, 1000) == pytest.approx(0.00138)
+    assert groq_mod._compute_cost("openai/gpt-oss-120b", 1000, 1000) == pytest.approx(0.00075)
+    assert groq_mod._compute_cost("qwen/qwen3-32b", 1000, 1000) == pytest.approx(0.00088)
+    assert groq_mod._compute_cost("gemma2-9b-it", 1000, 1000) is None
+
+
+def test_groq_price_needs_the_same_base_name(monkeypatch):
+    use_pricing(monkeypatch, {
+        "groq/llama-3.3-70b-versatile": {"prompt": 0.00059, "completion": 0.00079, "_provider": "groq"},
+        "groq/openai/gpt-oss-120b": {"prompt": 0.00015, "completion": 0.0006, "_provider": "groq"},
+    })
+    # A date suffix is not part of the base name, as in the platform's matcher.
+    assert groq_mod._compute_cost("openai/gpt-oss-120b-2025-08-05", 1000, 1000) == pytest.approx(0.00075)
+    # Another model whose name starts with a Groq model's name is not priced as that model.
+    assert groq_mod._compute_cost("llama-3.3-70b-versatile-0915", 1000, 1000) is None
+    assert groq_mod._compute_cost("openai/gpt-oss-120b-long", 1000, 1000) is None
+    assert groq_mod._compute_cost("llama-3.3-70b", 1000, 1000) is None
+
+
+def test_groq_price_uses_the_process_pricing_table(monkeypatch):
+    # A pricing_override given to start_tracing() reaches the settled cost.
+    use_pricing(monkeypatch, {"groq/llama-3.3-70b-versatile": {"prompt": 0.01, "completion": 0.02, "_provider": "groq"}})
+    assert groq_mod._compute_cost("llama-3.3-70b-versatile", 1000, 1000) == pytest.approx(0.03)
+
+
+def test_cached_prompt_tokens_are_priced_at_the_cached_rate(client, api, tracer, server, governed, monkeypatch):
+    use_pricing(monkeypatch, {
+        f"groq/{MODEL}": {"prompt": 0.001, "completion": 0.003, "cached_prompt": 0.0005, "_provider": "groq"},
+    })
+    usage = {**USAGE, "prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 800}}
+    api.completion = {**COMPLETION, "usage": usage}
+    create(client)
+    a = tracer.spans[0].attributes
+    assert a["llm.usage.prompt_tokens"] == 200
+    assert a["llm.usage.cache_read_tokens"] == 800
+    # 200 uncached at 0.001/1K + 800 cached at 0.0005/1K + 3 output at 0.003/1K
+    expected = 0.0002 + 0.0004 + 0.000009
+    assert settle_fields(server.settles[0]) == {
+        **priced(cost=pytest.approx(expected)),
+        "input_tokens": 1000,
+    }
+
+
+def test_cached_tokens_without_a_cached_rate_use_the_input_rate(monkeypatch):
+    use_pricing(monkeypatch, {f"groq/{MODEL}": {"prompt": 0.001, "completion": 0.003, "_provider": "groq"}})
+    assert groq_mod._compute_cost(MODEL, 1000, 0, 800) == pytest.approx(0.001)
+
+
+def test_span_cost_matches_the_settled_cost(client, api, tracer, server, governed, monkeypatch):
+    from traccia.processors.cost_processor import CostAnnotatingProcessor
+
+    table = {
+        "groq/qwen/qwen3-32b": {"prompt": 0.00029, "completion": 0.00059, "_provider": "groq"},
+        "ovhcloud/Qwen3-32B": {"prompt": 0.00008, "completion": 0.00023, "_provider": "ovhcloud"},
+    }
+    use_pricing(monkeypatch, table)
+    usage = {"prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000}
+    # Requested under one name, run and billed by Groq under another.
+    api.completion = {**COMPLETION, "model": "qwen/qwen3-32b", "usage": usage}
+    create(client)
+    span = tracer.spans[0]
+    assert span.attributes["llm.model"] == "qwen/qwen3-32b"
+    assert span.attributes["llm.request.model"] == MODEL
+    CostAnnotatingProcessor(pricing_table=table).on_end(span)
+    assert span.attributes["llm.cost.usd"] == pytest.approx(0.00088)
+    assert span.attributes["llm.pricing.model_key"] == "groq/qwen/qwen3-32b"
+    assert server.settles[0]["actual_usd"] == pytest.approx(0.00088)
+
+
+def test_stream_settles_for_the_agent_that_made_the_call(client, server):
+    with runtime_config.run_identity(agent_id="agent-a", pep_enabled=True):
+        stream = create(client, stream=True)
+    with runtime_config.run_identity(agent_id="agent-b", pep_enabled=False):
+        for _ in stream:
+            pass
+    assert [s["agent_id"] for s in server.settles] == ["agent-a"]
+
+
+def test_raw_stream_response_traces_the_parsed_stream(client, server, governed):
+    raw = client.chat.completions.with_raw_response.create(model=MODEL, messages=MESSAGES, stream=True)
+    assert server.settles == []
+    text = "".join(c.choices[0].delta.content or "" for c in raw.parse())
+    assert text == "Paris."
+    assert [settle_fields(s) for s in server.settles] == [priced()]
+
+
+# -- async -------------------------------------------------------------------------
+
+
+def test_async_completion_is_settled_with_its_cost(async_client, tracer, server, governed):
+    response = asyncio.run(create(async_client))
+    assert response.choices[0].message.content == "Paris."
+    assert tracer.spans[0].ended == 1
+    assert server.checks[0]["context"]["vendor"] == "groq"
+    assert [settle_fields(s) for s in server.settles] == [priced()]
+
+
+def test_async_stream_read_to_the_end_is_priced(async_client, tracer, server, governed):
     async def run():
-        stream = await A().create(
-            model="llama-3.3-70b-versatile", messages=MSGS, stream=True
-        )
-        assert not fake_tracer.spans[-1].ended
+        stream = await create(async_client, stream=True)
         return "".join([c.choices[0].delta.content or "" async for c in stream])
 
     assert asyncio.run(run()) == "Paris."
-    _assert_stream_span(fake_tracer.spans[-1])
+    assert tracer.spans[0].ended == 1
+    assert [settle_fields(s) for s in server.settles] == [priced()]
 
 
-def test_stream_usage_from_include_usage_chunk(monkeypatch, fake_tracer):
-    chunks = [_chunk("Paris.", finish_reason="stop"), _chunk(usage=USAGE)]
-    chunks[1].choices = []  # include_usage sends a final chunk with no choices
-    S, _ = _install_streaming(monkeypatch, chunks)
-    list(S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True))
-    _assert_stream_span(fake_tracer.spans[-1])
-
-
-def test_stream_context_manager_closes_and_ends_span(monkeypatch, fake_tracer):
-    S, _ = _install_streaming(monkeypatch)
-    with S().create(
-        model="llama-3.3-70b-versatile", messages=MSGS, stream=True
-    ) as stream:
-        next(stream)
-        inner = stream._stream
-    span = fake_tracer.spans[-1]
-    assert inner.closed
-    assert span.end_count == 1
-    assert span.attributes["llm.completion"] == "Par"
-
-
-def test_async_stream_context_manager_closes_and_ends_span(monkeypatch, fake_tracer):
-    _, A = _install_streaming(monkeypatch)
-
+def test_async_stream_closed_early_settles_what_was_streamed(async_client, server, governed):
     async def run():
-        async with await A().create(model="m", messages=MSGS, stream=True) as stream:
-            await stream.__anext__()
-            return stream._stream
+        stream = await create(async_client, stream=True)
+        async for c in stream:
+            if c.choices[0].delta.content:
+                break
+        await stream.close()
 
-    inner = asyncio.run(run())
-    assert inner.closed
-    assert fake_tracer.spans[-1].end_count == 1
-
-
-def _wait_for_end(span, timeout=2.0):
-    deadline = time.monotonic() + timeout
-    while not span.ended and time.monotonic() < deadline:
-        time.sleep(0.005)
+    asyncio.run(run())
+    assert [settle_fields(s) for s in server.settles] == [estimated(1)]
 
 
-def test_abandoned_stream_ends_span_on_gc(monkeypatch, fake_tracer):
-    S, _ = _install_streaming(monkeypatch)
-    stream = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-    for _ in stream:
-        break
-    del stream
-    gc.collect()
-    span = fake_tracer.spans[-1]
-    _wait_for_end(span)
-    assert span.end_count == 1
-    assert span.attributes["llm.completion"] == "Par"
+def test_async_http_error_releases(async_client, api, server, governed):
+    api.status = 400
+    with pytest.raises(groq.BadRequestError):
+        asyncio.run(create(async_client))
+    assert settle_fields(server.settles[0])["release"] is True
 
 
-def test_abandoned_stream_settles_off_the_collecting_thread(monkeypatch, fake_tracer, pep):
-    _, calls = pep
-    threads = []
-    monkeypatch.setattr(
-        groq_mod, "_record_result", lambda *a, **kw: threads.append(threading.get_ident())
-    )
-    S, _ = _install_streaming(monkeypatch)
-    stream = S().create(model="m", messages=MSGS, stream=True)
-    for _ in stream:
-        break
-    del stream
-    gc.collect()
-    _wait_for_end(fake_tracer.spans[-1])
-    assert threads and threads[0] != threading.get_ident()
-
-
-def test_stream_error_mid_iteration(monkeypatch, fake_tracer):
-    S, _ = _install_streaming(monkeypatch, CHUNKS[:1], RuntimeError("connection reset"))
-    stream = S().create(model="m", messages=MSGS, stream=True)
-    with pytest.raises(RuntimeError):
-        list(stream)
-    span = fake_tracer.spans[-1]
-    assert span.status == (SpanStatus.ERROR, "connection reset")
-    assert span.attributes["llm.completion"] == "Par"
-    assert span.end_count == 1
-
-
-def test_stream_proxy_forwards_attributes(monkeypatch, fake_tracer):
-    S, _ = _install_streaming(monkeypatch)
-    stream = S().create(model="m", messages=MSGS, stream=True)
-    assert stream.response == "raw-http-response"
-    stream.close()
-
-
-def test_stream_settles_after_consumption(monkeypatch, fake_tracer, pep):
-    pep_mod, calls = pep
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-    S, _ = _install_streaming(monkeypatch)
-    stream = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-    assert calls["finish"] == []  # nothing settled until the stream is read
-    list(stream)
-    assert len(calls["finish"]) == 1
-    assert calls["finish"][0][1]["actual_usd"] > 0
-
-
-def test_stream_error_releases_reservation(monkeypatch, fake_tracer, pep):
-    pep_mod, calls = pep
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-    S, _ = _install_streaming(monkeypatch, CHUNKS[:1], RuntimeError("x"))
-    with pytest.raises(RuntimeError):
-        list(S().create(model="m", messages=MSGS, stream=True))
-    assert calls["finish"] == [({"effect": "allow", "id": "d1"}, {"release": True})]
-
-
-# Streaming: settlement identity and cancellation
-@pytest.fixture
-def settle_spy(monkeypatch):
-    """Allow every call and record the agent, PEP flag and current span each settle sees."""
-    from opentelemetry import trace as otel_trace
-
-    from traccia import runtime_config
-    import traccia.governance.pep as pep_mod
-
-    seen = []
-
-    def spy(decision, **kw):
-        seen.append(
-            {
-                "agent": runtime_config.get_agent_id(),
-                "pep": runtime_config.pep_enabled(),
-                "span": otel_trace.get_current_span(),
-                "kw": kw,
-            }
-        )
-
-    monkeypatch.setattr(pep_mod, "finish_llm_call", spy)
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-    return seen
-
-
-def test_stream_settles_for_creating_agent(monkeypatch, fake_tracer, settle_spy):
-    from traccia import runtime_config
-    import traccia.metrics.recorder as rec_mod
-
-    metrics = {}
-
-    class Rec:
-        def record_token_usage(self, **kw):
-            metrics["agent"] = kw["attributes"].get("agent.id")
-
-        def record_duration(self, d, **kw):
-            pass
-
-        def record_cost(self, c, **kw):
-            pass
-
-    monkeypatch.setattr(rec_mod, "get_metrics_recorder", lambda: Rec())
-    S, _ = _install_streaming(monkeypatch)
-    with runtime_config.run_identity(agent_id="agent-a", pep_enabled=True):
-        stream = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-    with runtime_config.run_identity(agent_id="agent-b", pep_enabled=False):
-        list(stream)
-
-    assert len(settle_spy) == 1
-    assert settle_spy[0]["agent"] == "agent-a"
-    assert settle_spy[0]["pep"] is True
-    assert settle_spy[0]["span"] is fake_tracer.spans[-1]
-    assert metrics["agent"] == "agent-a"
-
-
-def test_stream_consumed_after_context_exit_still_settles(
-    monkeypatch, fake_tracer, settle_spy
-):
-    from traccia import runtime_config
-
-    S, _ = _install_streaming(monkeypatch)
-    with runtime_config.run_identity(agent_id="agent-a", pep_enabled=True):
-        stream = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-    list(stream)  # no run identity is active here
-    assert [s["agent"] for s in settle_spy] == ["agent-a"]
-    assert settle_spy[0]["kw"]["actual_usd"] > 0
-
-
-def test_async_stream_consumed_in_other_task_settles_for_creating_agent(
-    monkeypatch, fake_tracer, settle_spy
-):
-    from traccia import runtime_config
-
-    _, A = _install_streaming(monkeypatch)
-
+def test_async_stream_settles_for_the_creating_agent(async_client, server):
     async def run():
         with runtime_config.run_identity(agent_id="agent-a", pep_enabled=True):
-            stream = await A().create(model="m", messages=MSGS, stream=True)
-
-        async def consume():
-            with runtime_config.run_identity(agent_id="agent-b"):
-                return [c async for c in stream]
-
-        await asyncio.create_task(consume())
-
-    asyncio.run(run())
-    assert [s["agent"] for s in settle_spy] == ["agent-a"]
-    assert settle_spy[0]["span"] is fake_tracer.spans[-1]
-
-
-def test_async_cancel_during_create_ends_span_and_releases(
-    monkeypatch, fake_tracer, pep
-):
-    pep_mod, calls = pep
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-    S, A = _make_classes()
-
-    async def slow(self, **kw):
-        await asyncio.sleep(10)
-
-    A.create = slow
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-
-    async def run():
-        task = asyncio.create_task(A().create(model="m", messages=MSGS))
-        await asyncio.sleep(0)  # let the call start and block on the provider
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(run())
-    span = fake_tracer.spans[-1]
-    assert span.end_count == 1
-    assert span.status == (SpanStatus.ERROR, "CancelledError")
-    assert calls["finish"] == [({"effect": "allow", "id": "d1"}, {"release": True})]
-
-
-def test_async_cancel_during_stream_iteration_ends_span_and_releases(
-    monkeypatch, fake_tracer, pep
-):
-    pep_mod, calls = pep
-    monkeypatch.setattr(
-        pep_mod, "check_policy", lambda **kw: {"effect": "allow", "id": "d1"}
-    )
-
-    class HangingAsyncStream(FakeAsyncStream):
-        async def __anext__(self):
-            if self._chunks:
-                return self._chunks.pop(0)
-            await asyncio.sleep(10)  # the next chunk never arrives
-
-    S, A = _make_classes()
-
-    async def create(self, **kw):
-        return HangingAsyncStream(CHUNKS[:1])
-
-    A.create = create
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-
-    async def run():
-        stream = await A().create(model="m", messages=MSGS, stream=True)
-
-        async def consume():
+            stream = await create(async_client, stream=True)
+        with runtime_config.run_identity(agent_id="agent-b", pep_enabled=False):
             async for _ in stream:
                 pass
 
-        task = asyncio.create_task(consume())
-        await asyncio.sleep(0.01)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
     asyncio.run(run())
-    span = fake_tracer.spans[-1]
-    assert span.end_count == 1
-    assert span.status[0] == SpanStatus.ERROR
-    assert calls["finish"] == [({"effect": "allow", "id": "d1"}, {"release": True})]
+    assert [s["agent_id"] for s in server.settles] == ["agent-a"]
 
 
-def test_keyboard_interrupt_mid_stream_ends_span(monkeypatch, fake_tracer):
-    S, _ = _install_streaming(monkeypatch, CHUNKS[:1], KeyboardInterrupt())
-    stream = S().create(model="m", messages=MSGS, stream=True)
-    with pytest.raises(KeyboardInterrupt):
-        list(stream)
-    span = fake_tracer.spans[-1]
-    assert span.end_count == 1
-    assert span.status == (SpanStatus.ERROR, "KeyboardInterrupt")
+# -- regression: no billed Groq call may settle for $0 ----------------------------
 
 
-# Raw responses (with_raw_response / with_streaming_response) of streamed calls
+SCENARIOS = {
+    "completion": lambda c: create(c),
+    "stream": lambda c: [x for x in create(c, stream=True)],
+    "stream_closed_early": lambda c: (lambda s: (next(iter(s)), next(iter(s)), s.close()))(create(c, stream=True)),
+    "raw_response": lambda c: c.chat.completions.with_raw_response.create(model=MODEL, messages=MESSAGES).parse(),
+}
 
 
-class FakeRawResponse:
-    """groq's APIResponse: parse() returns the stream; http_response is the httpx response."""
-
-    def __init__(self, stream):
-        self._stream, self.http_response, self.closed = stream, "httpx-response", False
-        self.headers = {"x-ratelimit-remaining-requests": "99"}
-
-    def parse(self, **kw):
-        return self._stream
-
-    def close(self):
-        self.closed = True
-
-
-class FakeAsyncRawResponse(FakeRawResponse):
-    async def parse(self, **kw):
-        return self._stream
-
-    async def close(self):
-        self.closed = True
-
-
-def _install_raw_streaming(monkeypatch, chunks=CHUNKS):
-    S, A = _make_classes()
-    S.create = lambda self, **kw: FakeRawResponse(FakeStream(chunks))
-
-    async def acreate(self, **kw):
-        return FakeAsyncRawResponse(FakeAsyncStream(chunks))
-
-    A.create = acreate
-    _install_sdk(monkeypatch, S, A)
-    patch_groq()
-    return S, A
-
-
-def test_raw_streamed_call_traces_the_parsed_stream(monkeypatch, fake_tracer):
-    S, _ = _install_raw_streaming(monkeypatch)
-    raw = S().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-    assert raw.headers["x-ratelimit-remaining-requests"] == "99"
-    span = fake_tracer.spans[-1]
-    assert not span.ended
-    stream = raw.parse()
-    assert raw.parse() is stream  # parsed once, like groq's cached parse()
-    assert "".join(c.choices[0].delta.content or "" for c in stream) == "Paris."
-    _assert_stream_span(span)
-
-
-def test_async_raw_streamed_call_traces_the_parsed_stream(monkeypatch, fake_tracer):
-    _, A = _install_raw_streaming(monkeypatch)
-
-    async def run():
-        raw = await A().create(model="llama-3.3-70b-versatile", messages=MSGS, stream=True)
-        return "".join([c.choices[0].delta.content or "" async for c in await raw.parse()])
-
-    assert asyncio.run(run()) == "Paris."
-    _assert_stream_span(fake_tracer.spans[-1])
-
-
-def test_raw_streamed_call_closed_without_parsing_ends_span(monkeypatch, fake_tracer):
-    S, _ = _install_raw_streaming(monkeypatch)
-    raw = S().create(model="m", messages=MSGS, stream=True)
-    raw.close()  # what with_streaming_response does on exit
-    assert raw._raw.closed
-    assert fake_tracer.spans[-1].end_count == 1
-
-
-def test_raw_streamed_call_dropped_without_parsing_ends_span(monkeypatch, fake_tracer):
-    S, _ = _install_raw_streaming(monkeypatch)
-    raw = S().create(model="m", messages=MSGS, stream=True)
-    del raw
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_billed_call_is_never_settled_without_a_cost_or_tokens(name, client, server, governed):
+    SCENARIOS[name](client)
     gc.collect()
-    span = fake_tracer.spans[-1]
-    _wait_for_end(span)
-    assert span.end_count == 1
+    [settle] = server.settles
+    assert settle["release"] is False
+    assert settle["actual_usd"] is not None or (
+        settle["input_tokens"] is not None and settle["output_tokens"] is not None
+    ), f"{name} would be refunded by the server: {settle}"
 
+
+def test_reshape_never_changes_the_callers_params(client, api, server, governed):
+    server.decision = {
+        "effect": "reshape",
+        "would_have": False,
+        "obligations": {"reserved_usd": RESERVED, "cheaper_model": "llama-3.1-8b-instant", "clamp_max_tokens": 10},
+    }
+    params = {"model": MODEL, "messages": MESSAGES, "max_tokens": 4000}
+    client.chat.completions.create(**params)
+    client.chat.completions.create(**params)
+    assert params == {"model": MODEL, "messages": MESSAGES, "max_tokens": 4000}
+    # Each call is checked as written, and sends the reshaped request.
+    assert [c["context"]["model"] for c in server.checks] == [MODEL, MODEL]
+    assert [(r["model"], r["max_tokens"]) for r in api.requests] == [("llama-3.1-8b-instant", 10)] * 2
