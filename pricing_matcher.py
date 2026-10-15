@@ -4,7 +4,8 @@ Names are compared by their base name: lower-cased, without the provider path
 (groq/openai/gpt-oss-120b -> gpt-oss-120b), a Bedrock region (us.), or a date or
 -latest suffix. Among keys with the same base name, the span's vendor's own key wins
 (its key for the exact dated version first), then the key for the exact name, then the
-shortest key. A name with no matching base name gets no price.
+shortest key. A name with no matching base name gets no price, and neither does a call from
+a strict vendor (Groq) whose own keys do not have it.
 
 Kept identical in three repos, which all run tests/fixtures/pricing_match_cases.json:
 
@@ -31,6 +32,12 @@ _VENDOR_PROVIDERS = {
     "google": ("vertex_ai",),  # LangChain Vertex AI models
     "aws": ("bedrock",),  # LangChain Bedrock models
 }
+
+# llm.vendor values set only by a provider's own SDK, which calls no other provider (the openai
+# SDK also calls OpenAI-compatible providers, so "openai" is not one). Their calls are priced
+# only from that provider's keys, never from another provider's key for the same model name.
+# The SDKs' cost engines apply the same rule (STRICT_VENDORS).
+_STRICT_VENDORS = frozenset({"groq"})
 
 
 class PriceMatch(NamedTuple):
@@ -115,6 +122,8 @@ def match_model(
         keys,
         key=lambda k: (not own(k), k != model, not (own(k) and _name(k) == wanted), len(k), k),
     )
+    if not own(key) and str(vendor or "").strip().lower() in _STRICT_VENDORS:
+        return None
     if key == model:
         return PriceMatch(key, "exact", _provider(key, table[key]))
     ambiguous = not own(key) and len({_provider(k, table[k]) for k in keys}) > 1
