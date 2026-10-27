@@ -142,3 +142,33 @@ def test_inflight_coalescing(mock_fetch):
 
     assert not errors
     assert call_count["n"] == 1
+
+
+_NO_KEY = (None, "https://api.traccia.ai/v1/traces")
+_NO_ENDPOINT = ("key", None)
+
+
+@pytest.mark.parametrize(
+    "credentials, message",
+    [(_NO_KEY, "API key not found"), (_NO_ENDPOINT, "endpoint not found")],
+)
+@patch("traccia.governance.policy._http_session")
+@patch("traccia.governance.policy.client_config.resolve_credentials")
+def test_check_agent_status_fail_closed_without_credentials(mock_credentials, mock_session, credentials, message):
+    mock_credentials.return_value = credentials
+
+    with pytest.raises(AgentBlockedError) as exc:
+        check_agent_status("agent-1", fail_open=False)
+    assert message in str(exc.value)
+    assert "fail_open is False" in str(exc.value)
+    mock_session.get.assert_not_called()
+
+
+@pytest.mark.parametrize("credentials", [_NO_KEY, _NO_ENDPOINT])
+@patch("traccia.governance.policy._http_session")
+@patch("traccia.governance.policy.client_config.resolve_credentials")
+def test_check_agent_status_fail_open_without_credentials(mock_credentials, mock_session, credentials):
+    mock_credentials.return_value = credentials
+
+    check_agent_status("agent-1", fail_open=True)
+    mock_session.get.assert_not_called()

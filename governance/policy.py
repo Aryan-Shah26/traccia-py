@@ -166,19 +166,29 @@ def _record_block_async(
     threading.Thread(target=_post, daemon=True).start()
 
 
+def _missing_setting(message: str, *, fail_open: bool) -> None:
+    if fail_open:
+        logger.warning("%s Use @observe for tracing-only setups.", message)
+        return
+    raise AgentBlockedError(
+        f"{message} Blocking execution because fail_open is False. "
+        "Set TRACCIA_API_KEY and TRACCIA_ENDPOINT, or pass fail_open=True."
+    )
+
+
 def _fetch_and_apply_status(agent_id: str, *, fail_open: bool) -> None:
     api_key, traces_endpoint = client_config.resolve_credentials()
     if not api_key:
-        logger.warning(
-            "Traccia API key not found. @govern requires a Traccia platform account; "
-            "use @observe for tracing-only setups."
+        _missing_setting(
+            "Traccia API key not found. @govern requires a Traccia platform account.",
+            fail_open=fail_open,
         )
         return
 
     if not traces_endpoint:
-        logger.warning(
-            "Traccia endpoint not found. @govern requires a Traccia platform endpoint; "
-            "use @observe for tracing-only setups."
+        _missing_setting(
+            "Traccia endpoint not found. @govern requires a Traccia platform endpoint.",
+            fail_open=fail_open,
         )
         return
 
