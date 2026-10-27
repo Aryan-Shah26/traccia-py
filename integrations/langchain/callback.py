@@ -18,7 +18,6 @@ except ImportError as e:
     ) from e
 
 from traccia import get_tracer
-from traccia.tracer.span import SpanStatus
 
 
 class TracciaCallbackHandler(BaseCallbackHandler):
@@ -192,8 +191,7 @@ class TracciaCallbackHandler(BaseCallbackHandler):
                 return
             
             # Record exception on span
-            span._otel_span.record_exception(error)
-            span.set_status(SpanStatus.ERROR, str(error))
+            span.record_exception(error)
             
             # Record exception metric
             self._record_langchain_exception(span)

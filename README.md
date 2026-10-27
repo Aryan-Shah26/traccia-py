@@ -191,6 +191,24 @@ print(result.url)
 
 See [Evaluate in the SDK](https://traccia.ai/docs/sdk/evaluate) and the walkthrough [Run Experiments From Code](https://traccia.ai/docs/guides/sdk-evaluate).
 
+### Run evals in CI
+
+`traccia eval` runs a task script, saves an experiment, and writes `summary.json`. The process exit code is the gate: 0 pass, 1 quality miss, 2 bad command or baseline, 3 untrustworthy evidence, 4 the experiment did not save, 5 the summary file was not written. With no pass-rate bar, a green check is **Execution Only**. Add `--min-pass-rate` or `--max-drop` for a **Quality Gate**. `--max-drop 0.05` is five percentage points. `--max-task-cost-increase 0.2` is 20 percent.
+
+The script defines `task` and, for a function in the file, a `scorers` dict passed as `--scorer local:name`. A local scorer cannot pass `--max-drop`. Pass `--prompt` with `--prompt-version` or `--prompt-label` when the experiment should record a prompt version. Platform LLM-judge and Jev scorers read `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `GROQ_API_KEY`, and `TYPESAFE_API_KEY`, or a JSON object in `TRACCIA_PROVIDER_KEYS`. Those values are not written into the summary. Each Jev question is gated on its own pass rate. Execution Only means no pass-rate gate; cost and latency gates can still apply.
+
+```bash
+traccia eval experiments/support_agent.py \
+  --output summary.json \
+  --dataset support-golden \
+  --scorer exact_match \
+  --min-pass-rate 0.9 \
+  --baseline-prompt support-reply \
+  --max-drop 0.05
+```
+
+See [Run Evals In CI](https://traccia.ai/docs/guides/ci-evals).
+
 ### LangChain
 
 Create a callback handler and pass it to `config={"callbacks": [traccia_handler]}`. Install the optional extra: `pip install traccia[langchain]`.

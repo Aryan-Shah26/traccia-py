@@ -1,6 +1,7 @@
 """Tests for PII redaction helpers."""
 
 from traccia.processors.redaction_processor import (
+    RedactionSpanProcessor,
     apply_redaction_to_span,
     redact_attributes,
     redact_string,
@@ -83,3 +84,160 @@ def test_redaction_allowlists_traccia_policy_effect():
     assert out["traccia.policy.effect"] == "deny"
     assert out["traccia.policy.matched"] is True
     assert "[REDACTED_EMAIL]" in out["llm.prompt"]
+
+
+class _FakeEventSpan(_FakeSpan):
+    def __init__(self, attrs: dict, events=None, status_description=None):
+        super().__init__(attrs)
+        self.events = events or []
+        self.status_description = status_description
+
+
+def test_processor_honors_redact_all_strings_for_opaque_keys():
+    from traccia.processors.redaction_processor import RedactionSpanProcessor
+
+    span = _FakeEventSpan({"opaque.field": "mail x@y.io", "count": 3})
+    RedactionSpanProcessor(redact_all_strings=True).on_end(span)
+    assert span.attributes["opaque.field"] == "mail [REDACTED_EMAIL]"
+    assert span.attributes["count"] == 3
+
+
+def test_default_redaction_covers_result_and_nested_values():
+    span = _FakeEventSpan(
+        {
+            "result": "send to x@y.io",
+            "llm.prompt": ["hi x@y.io", "ok"],
+            "meta": {"text": "x@y.io", "nested": [{"content": "x@y.io"}]},
+        }
+    )
+    apply_redaction_to_span(span)
+    assert "x@y.io" not in repr(span.attributes)
+
+
+def test_redaction_covers_events_exceptions_and_status():
+    from traccia.processors.redaction_processor import RedactionSpanProcessor
+
+    span = _FakeEventSpan(
+        {"safe": "v"},
+        events=[
+            {"name": "custom", "attributes": {"payload": "x@y.io"}},
+            {
+                "name": "exception",
+                "attributes": {
+                    "exception.message": "bad x@y.io",
+                    "exception.stacktrace": "Traceback ... ValueError: bad x@y.io",
+                },
+            },
+        ],
+        status_description="bad x@y.io",
+    )
+    RedactionSpanProcessor(redact_all_strings=True).on_end(span)
+    assert "x@y.io" not in repr(span.events)
+    assert span.status_description == "bad [REDACTED_EMAIL]"
+
+
+def _provider_with_memory_exporter(**processor_kwargs):
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from traccia.tracer.provider import TracerProvider
+
+    provider = TracerProvider()
+    provider.add_span_processor(RedactionSpanProcessor(**processor_kwargs))
+    exporter = InMemorySpanExporter()
+    provider._otel_provider.add_span_processor(SimpleSpanProcessor(exporter))
+    return provider.get_tracer("test"), exporter
+
+
+def _dump(exported):
+    return (
+        repr(dict(exported.attributes))
+        + repr([(e.name, dict(e.attributes or {})) for e in exported.events])
+        + repr(exported.status.description)
+    )
+
+
+def test_end_to_end_export_redacts_events_and_exceptions():
+    tracer, exporter = _provider_with_memory_exporter(redact_all_strings=True)
+    try:
+        with tracer.start_as_current_span("op") as span:
+            span.set_attribute("opaque", "x@y.io")
+            span.add_event("custom", {"payload": "x@y.io"})
+            raise ValueError("bad x@y.io")
+    except ValueError:
+        pass
+
+    (exported,) = exporter.get_finished_spans()
+    assert "x@y.io" not in _dump(exported)
+    assert [e.name for e in exported.events] == ["custom", "exception"]
+
+
+def test_current_span_wrapper_events_are_exported_and_redacted():
+    from traccia.context.context import get_current_span
+
+    tracer, exporter = _provider_with_memory_exporter(redact_all_strings=True)
+    with tracer.start_as_current_span("op"):
+        current = get_current_span()
+        current.add_event("custom", {"payload": "x@y.io"})
+        current.record_exception(ValueError("bad x@y.io"))
+
+    (exported,) = exporter.get_finished_spans()
+    assert [e.name for e in exported.events] == ["custom", "exception"]
+    assert "x@y.io" not in _dump(exported)
+
+
+def test_native_otel_events_and_status_are_redacted():
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.trace import StatusCode
+
+    tracer, exporter = _provider_with_memory_exporter(redact_all_strings=True)
+    with tracer.start_as_current_span("op"):
+        native = otel_trace.get_current_span()
+        native.record_exception(ValueError("bad x@y.io"))
+        native.add_event("native", {"payload": "x@y.io"})
+        native.set_status(StatusCode.ERROR, "bad x@y.io")
+
+    (exported,) = exporter.get_finished_spans()
+    assert [e.name for e in exported.events] == ["exception", "native"]
+    assert "x@y.io" not in _dump(exported)
+
+
+def test_nested_values_inherit_parent_key_sensitivity():
+    out = redact_attributes({"result": {"answer": "x@y.io", "items": [{"v": "x@y.io"}]}, "opaque": {"v": "x@y.io"}})
+    assert "x@y.io" not in repr(out["result"])
+    assert out["opaque"] == {"v": "x@y.io"}
+
+
+def test_otel_event_limits_are_preserved(monkeypatch):
+    monkeypatch.setenv("OTEL_SPAN_EVENT_COUNT_LIMIT", "2")
+    tracer, exporter = _provider_with_memory_exporter(redact_all_strings=True)
+    with tracer.start_as_current_span("op") as span:
+        for i in range(1000):
+            span.add_event("e", {"payload": f"user{i}@y.io"})
+        assert len(span.events) == 2
+
+    (exported,) = exporter.get_finished_spans()
+    assert len(exported.events) == 2
+    assert exported.dropped_events == 998
+    assert "@y.io" not in _dump(exported)
+
+
+def test_init_span_logging_runs_after_redaction():
+    from traccia import get_tracer_provider, init, stop_tracing
+    from traccia.processors.logging_processor import LoggingSpanProcessor
+
+    stop_tracing()  # other tests may leave tracing started, which makes init() a no-op
+    try:
+        init(
+            enable_patching=False,
+            auto_start_trace=False,
+            redact_pii=True,
+            enable_span_logging=True,
+            enable_metrics=False,
+        )
+        procs = get_tracer_provider()._enrichment_processors
+        redact_idx = next(i for i, p in enumerate(procs) if isinstance(p, RedactionSpanProcessor))
+        log_idx = next(i for i, p in enumerate(procs) if isinstance(p, LoggingSpanProcessor))
+        assert redact_idx < log_idx
+    finally:
+        stop_tracing()
