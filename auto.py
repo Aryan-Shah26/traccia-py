@@ -402,7 +402,7 @@ def start_tracing(
     provider = _get_provider()
     key = env_cfg.get("api_key") or api_key
     endpoint = env_cfg.get("endpoint") or endpoint
-    # Policy, prompts and evals read this instead of re-loading env/file config.
+    # Policy, prompts and evals use this key/endpoint pair when it has a key.
     client_config.set_client_config(key, endpoint or DEFAULT_OTLP_TRACE_ENDPOINT)
     try:
         sample_rate = float(env_cfg.get("sample_rate", sample_rate))

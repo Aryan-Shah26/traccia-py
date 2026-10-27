@@ -37,15 +37,18 @@ def resolve_credentials(
 ) -> Tuple[Optional[str], Optional[str]]:
     """Return (api_key, traces_endpoint).
 
-    Priority per field: explicit argument > init() config > env/config file (when init() did not set it).
+    An explicit argument wins for its field. Otherwise the key and endpoint come
+    as a pair from one source: the init() config when it has a key, else
+    env/config file. The init() endpoint may be the default, so it is never
+    paired with a key from another source.
     """
     effective = _client_config
-    key = api_key or (effective.api_key if effective else None)
-    traces = endpoint or (effective.endpoint if effective else None)
-    if not key or not traces:
-        from traccia.config import load_config
+    if effective and effective.api_key:
+        return api_key or effective.api_key, endpoint or effective.endpoint
 
-        cfg = load_config()
-        key = key or cfg.tracing.api_key or os.environ.get("TRACCIA_API_KEY")
-        traces = traces or cfg.tracing.endpoint or os.environ.get("TRACCIA_ENDPOINT")
+    from traccia.config import load_config
+
+    cfg = load_config()
+    key = api_key or cfg.tracing.api_key or os.environ.get("TRACCIA_API_KEY")
+    traces = endpoint or cfg.tracing.endpoint or os.environ.get("TRACCIA_ENDPOINT")
     return key, traces
