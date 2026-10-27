@@ -120,11 +120,11 @@ def match_model(
     def own(key: str) -> bool:
         return _in_family(_provider(key, table[key]), providers)
 
-    # A dated version only beats the generic key among the vendor's own keys; a
-    # reseller's dated key is no better a guess than the shortest key.
+    # The vendor's own keys first; then a key for the exact name (with its date or -latest)
+    # before the shortest key, also when the vendor has no key of its own.
     key = min(
         keys,
-        key=lambda k: (not own(k), k != model, not (own(k) and _name(k) == wanted), len(k), k),
+        key=lambda k: (not own(k), k != model, _name(k) != wanted, len(k), k),
     )
     if not own(key) and str(vendor or "").strip().lower() in _STRICT_VENDORS:
         return None
