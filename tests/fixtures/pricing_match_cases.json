@@ -31,7 +31,8 @@
     "cloudflare/@cf/mistral/mistral-7b-instruct-v0.1": {"prompt": 0.001923, "completion": 0.001923, "_provider": "cloudflare"},
     "fireworks_ai/accounts/fireworks/models/": {"prompt": 0.0009, "completion": 0.0009, "_provider": "fireworks_ai"},
     "command-r": {"prompt": 0.00015, "completion": 0.0006, "_provider": "cohere_chat"},
-    "openrouter/cohere/command-r": {"prompt": 0.0005, "completion": 0.0015, "_provider": "openrouter"}
+    "openrouter/cohere/command-r": {"prompt": 0.0005, "completion": 0.0015, "_provider": "openrouter"},
+    "ft:gpt-4o-mini-2024-07-18": {"prompt": 0.0003, "completion": 0.0012, "_provider": "openai"}
   },
   "cases": [
     {"model": "gpt-4o", "vendor": null, "key": "gpt-4o", "kind": "exact"},
@@ -82,6 +83,10 @@
 
     {"model": "cohere/command-r", "vendor": "cohere", "key": "command-r", "kind": "base", "ambiguous": false},
     {"model": "models/gemini-2.5-flash", "vendor": "google", "key": "gemini-2.5-flash", "kind": "base", "ambiguous": false},
-    {"model": "models/gemini-2.5-flash", "vendor": "googlex", "key": "gemini-2.5-flash", "kind": "base", "ambiguous": true}
+    {"model": "models/gemini-2.5-flash", "vendor": "googlex", "key": "gemini-2.5-flash", "kind": "base", "ambiguous": true},
+    {"model": "ft:gpt-4o-mini-2024-07-18:my-org::abc123", "vendor": "openai", "key": "ft:gpt-4o-mini-2024-07-18", "kind": "base"},
+    {"model": "ft:gpt-4o-mini-2024-07-18:my-org:custom-suffix:abc123", "vendor": null, "key": "ft:gpt-4o-mini-2024-07-18", "kind": "base"},
+    {"model": "ft:gpt-4o-mini-2024-07-18", "vendor": "openai", "key": "ft:gpt-4o-mini-2024-07-18", "kind": "exact"},
+    {"model": "ft:gpt-4o-2024-08-06:my-org::abc123", "vendor": "openai", "key": null, "kind": null}
   ]
 }

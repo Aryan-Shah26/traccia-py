@@ -49,8 +49,12 @@ class PriceMatch(NamedTuple):
 
 
 def _name(name: str) -> str:
-    """Lower-cased, without the provider path or region; the date is kept."""
-    return _REGION.sub("", name.strip().lower().rsplit("/", 1)[-1])
+    """Lower-cased, without the provider path or region; the date is kept. An OpenAI
+    fine-tune (ft:<base>:<org>:<suffix>:<id>) is named ft:<base>."""
+    name = _REGION.sub("", name.strip().lower().rsplit("/", 1)[-1])
+    if name.startswith("ft:"):
+        name = ":".join(name.split(":", 2)[:2])
+    return name
 
 
 def base_name(name: str) -> str:
