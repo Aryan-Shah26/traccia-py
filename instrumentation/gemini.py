@@ -9,15 +9,16 @@ from traccia.tracer.span import SpanStatus
 _patched = False
 
 
-def _compute_cost(model, prompt_tokens, completion_tokens):
-    """Compute cost from token usage using pricing config."""
+def _compute_cost(model, prompt_tokens, completion_tokens, vendor="google_gemini"):
+    """Cost of one call, priced like its span: with the vendor it sets as llm.vendor, from the
+    shared resolver's table (which includes pricing overrides)."""
     if not model or prompt_tokens is None or completion_tokens is None:
         return None
     try:
-        from traccia.pricing_config import load_pricing
+        from traccia.cost_resolver import get_resolver
         from traccia.processors.cost_engine import compute_cost as _compute
 
-        return _compute(model, prompt_tokens, completion_tokens, load_pricing())
+        return _compute(model, prompt_tokens, completion_tokens, get_resolver().pricing_table, vendor=vendor)
     except Exception:
         return None
 

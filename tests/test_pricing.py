@@ -638,3 +638,54 @@ class TestOverridesWinOverVendorMatching:
         CostAnnotatingProcessor(pricing_table=table, pricing_source="override").on_end(span)
         assert span.attributes["llm.cost.usd"] == pytest.approx(3.0)
         assert span.attributes["llm.pricing.model_key"] == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# Integration cost helpers price like the span: with the vendor, from the shared table
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def resolver_with_override(monkeypatch, no_env_override):
+    """The shared resolver holding a table with a $3.00 gpt-4o and claude-sonnet-4-5 override."""
+    import traccia.cost_resolver as cr
+    from traccia.pricing_config import load_pricing_with_source
+
+    override = {**GPT4O_OVERRIDE, "claude-sonnet-4-5": {"prompt": 1.0, "completion": 2.0}}
+    table, source, generated_at = load_pricing_with_source(override)
+    monkeypatch.setattr(cr, "_resolver", cr.CostResolver(table, source, generated_at))
+
+
+class TestIntegrationCostHelpers:
+    def test_gemini_cost_uses_the_gemini_api_rate(self, no_env_override):
+        from traccia.instrumentation.gemini import _compute_cost
+        from traccia.processors.cost_engine import compute_cost
+
+        expected = compute_cost("gemini-2.0-flash-001", 1_000_000, 1_000_000, vendor="google_gemini")
+        assert expected == pytest.approx(0.5)
+        assert _compute_cost("gemini-2.0-flash-001", 1_000_000, 1_000_000) == pytest.approx(expected)
+
+    def test_openai_cost_uses_the_shared_table_with_overrides(self, resolver_with_override):
+        from traccia.instrumentation.openai import _compute_cost
+
+        assert _compute_cost("gpt-4o", 1000, 1000) == pytest.approx(3.0)
+
+    def test_anthropic_cost_uses_the_shared_table_with_overrides(self, resolver_with_override):
+        from traccia.instrumentation.anthropic import _compute_cost
+
+        assert _compute_cost("claude-sonnet-4-5", 1000, 1000) == pytest.approx(3.0)
+
+    def test_agent_enricher_fallback_prices_with_the_span_vendor(self, resolver_with_override):
+        from traccia.processors.agent_enricher import AgentEnrichmentProcessor
+
+        span = MagicMock()
+        span.attributes = {
+            "agent.id": "agent-1",
+            "llm.vendor": "openai",
+            "llm.model": "gpt-4o",
+            "llm.usage.prompt_tokens": 1000,
+            "llm.usage.completion_tokens": 1000,
+        }
+        span.set_attribute.side_effect = lambda k, v: span.attributes.__setitem__(k, v)
+        AgentEnrichmentProcessor().on_end(span)
+        assert span.attributes["llm.cost.usd"] == pytest.approx(3.0)
