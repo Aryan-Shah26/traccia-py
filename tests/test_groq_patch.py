@@ -530,6 +530,44 @@ def test_stream_that_ended_without_output_or_usage_settles_a_one_token_estimate(
     assert [settle_fields(s) for s in server.settles] == [estimated(1)]
 
 
+# A reasoning model streams its reasoning in delta.reasoning before any content.
+REASONING = "x" * 42_500  # 10,625 output tokens at 4 characters a token
+REASONING_CHUNKS = [
+    chunk({"role": "assistant", "content": ""}, x_groq={"id": "req_1"}),
+    chunk({"reasoning": REASONING[:20_000]}),
+    chunk({"reasoning": REASONING[20_000:]}),
+    chunk({"content": "Paris."}),
+    chunk({}, "stop", x_groq={"id": "req_1", "usage": USAGE}),
+]
+
+
+def test_stream_stopped_during_reasoning_settles_the_reasoning_estimate(client, api, server, governed):
+    api.chunks = REASONING_CHUNKS
+    stream = create(client, stream=True)
+    for i, _ in enumerate(stream):
+        if i == 2:  # both reasoning chunks read, no content or usage yet
+            break
+    stream.close()
+    assert [settle_fields(s) for s in server.settles] == [estimated(10_625)]
+
+
+def test_error_during_reasoning_settles_the_reasoning_estimate(client, api, server, governed):
+    api.chunks = REASONING_CHUNKS[:3]
+    api.stream_error = "overloaded"
+    with pytest.raises(groq.APIError):
+        for _ in create(client, stream=True):
+            pass
+    assert [settle_fields(s) for s in server.settles] == [estimated(10_625)]
+
+
+def test_response_without_usage_counts_reasoning_as_output(client, api, server, governed):
+    message = {"role": "assistant", "content": "Paris.", "reasoning": REASONING}
+    api.completion = {**COMPLETION, "usage": None, "choices": [{"index": 0, "finish_reason": "stop", "message": message}]}
+    create(client)
+    # 42,500 + 6 characters: 10,627 output tokens.
+    assert settle_fields(server.settles[0]) == estimated(10_627)
+
+
 def test_settle_runs_in_the_background(client, server, governed, monkeypatch):
     import threading
 

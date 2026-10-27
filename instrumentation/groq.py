@@ -81,9 +81,13 @@ def _read_tokens(usage: Any) -> Optional[Tuple[int, int, int]]:
 
 
 def _output_chars(message: Any) -> int:
-    """Characters of output in a message or delta: its content plus tool call arguments."""
-    content = _safe_get(message, "content")
-    chars = len(content) if isinstance(content, str) else 0
+    """Characters of output in a message or delta: its content, reasoning (billed as output
+    tokens by reasoning models) and tool call arguments."""
+    chars = 0
+    for field in ("content", "reasoning"):
+        text = _safe_get(message, field)
+        if isinstance(text, str):
+            chars += len(text)
     tool_calls = _safe_get(message, "tool_calls")
     if isinstance(tool_calls, (list, tuple)):
         for call in tool_calls:
