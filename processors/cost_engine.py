@@ -124,20 +124,26 @@ def _vendor_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, Lis
     return index
 
 
-# The last table indexed for overrides: (table, its size, base name -> keys).
-_override_index: Tuple[Any, int, Dict[str, List[str]]] = (None, 0, {})
+# The last table indexed for overrides: (table, its size, vendor, base name -> keys).
+_override_index: Tuple[Any, int, Optional[str], Dict[str, List[str]]] = (None, 0, None, {})
 
 
-def _override_keys(table: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+def _override_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, List[str]]:
+    """Overrides usable for the vendor's calls: those naming no provider, or the vendor's.
+    Only an explicit _provider/provider counts; a key's path may be the model's org."""
     global _override_index
-    cached, size, index = _override_index
-    if cached is table and size == len(table):
+    cached, size, cached_vendor, index = _override_index
+    if cached is table and size == len(table) and cached_vendor == vendor:
         return index
     index = {}
     for key, entry in table.items():
-        if isinstance(entry, dict) and entry.get(OVERRIDE_FLAG):
-            index.setdefault(_base_name(key), []).append(key)
-    _override_index = (table, len(table), index)
+        if not (isinstance(entry, dict) and entry.get(OVERRIDE_FLAG)):
+            continue
+        provider = str(entry.get("_provider") or entry.get("provider") or "").lower()
+        if provider and not (provider == vendor or provider.startswith((vendor + "_", vendor + "-"))):
+            continue
+        index.setdefault(_base_name(key), []).append(key)
+    _override_index = (table, len(table), vendor, index)
     return index
 
 
@@ -158,9 +164,9 @@ def _match_base_name(
 def _lookup_vendor_price(
     model: str, table: Dict[str, Dict[str, Any]], vendor: str
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """A user override for *model* first, then the vendor's own entry (see _match_base_name).
-    None when neither exists."""
-    return _match_base_name(model, table, _override_keys(table)) or _match_base_name(
+    """A user override for *model* (see _override_keys) first, then the vendor's own entry
+    (see _match_base_name). None when neither exists."""
+    return _match_base_name(model, table, _override_keys(table, vendor)) or _match_base_name(
         model, table, _vendor_keys(table, vendor)
     )
 

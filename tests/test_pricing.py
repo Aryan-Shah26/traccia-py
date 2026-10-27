@@ -641,3 +641,17 @@ class TestOverridesWinForStrictVendors:
         # An explicit override is the user's price for that model name, whoever serves it.
         assert match_pricing_model_key("gemma2-9b-it", table, "groq") == "gemma2-9b-it"
         assert match_pricing_model_key(LLAMA, table, "groq") == f"groq/{LLAMA}"
+
+    def test_an_override_for_another_provider_does_not_price_a_groq_call(self, monkeypatch):
+        from traccia.pricing_config import load_pricing_with_source
+        from traccia.processors.cost_engine import compute_cost, match_pricing_model_key
+
+        monkeypatch.delenv("TRACCIA_PRICING_OVERRIDE_JSON", raising=False)
+        monkeypatch.delenv("AGENT_DASHBOARD_PRICING_JSON", raising=False)
+        other = {"prompt": 0.01, "completion": 0.01, "_provider": "together_ai"}
+        table, _, _ = load_pricing_with_source({f"together_ai/{LLAMA}": other})
+        assert match_pricing_model_key(LLAMA, table, "groq") == f"groq/{LLAMA}"
+        assert compute_cost(LLAMA, 1000, 1000, table, vendor="groq") == pytest.approx(0.00138)
+        # An override that names Groq, or names no provider, is used.
+        table, _, _ = load_pricing_with_source({LLAMA: {"prompt": 1.0, "completion": 2.0, "_provider": "groq"}})
+        assert compute_cost(LLAMA, 1000, 1000, table, vendor="groq") == pytest.approx(3.0)
