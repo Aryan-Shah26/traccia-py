@@ -18,8 +18,7 @@ class BatchSpanProcessor(SpanProcessor):
     Batch span processor that queues spans for export.
     
     Note: This runs as an enrichment processor (before span.end()),
-    but it queues spans and exports them after they end.
-    When exporting, it extracts ReadableSpan from the OTel span.
+    but it queues spans and exports them only after they end.
     """
     
     def __init__(
@@ -84,11 +83,19 @@ class BatchSpanProcessor(SpanProcessor):
                 return
 
     def shutdown(self) -> None:
-        """Shutdown the processor."""
+        """Shutdown the processor, then the exporter. Safe to call more than once."""
+        if self._shutdown:
+            return
         self._shutdown = True
         self._event.set()
         self._worker.join(timeout=self.schedule_delay * 2)
         self.force_flush()
+        if self.exporter is not None and hasattr(self.exporter, "shutdown"):
+            try:
+                self.exporter.shutdown()
+            except Exception:
+                import traceback
+                traceback.print_exc()
 
     # Internal
     def _worker_loop(self) -> None:
@@ -107,32 +114,33 @@ class BatchSpanProcessor(SpanProcessor):
         return True
 
     def _drain_queue(self, limit: int) -> List[Span]:
-        """Drain spans from queue up to limit."""
+        """
+        Drain ended spans from queue up to limit.
+
+        on_end() queues a span before Span.end() marks it ended, so a span can
+        still be ending when the queue is drained. Such spans are left in the
+        queue, in order, for a later flush instead of being dropped.
+        """
         items: List[Span] = []
+        still_ending: List[Span] = []
         with self._lock:
             while self._queue and len(items) < limit:
-                items.append(self._queue.popleft())
+                span = self._queue.popleft()
+                if getattr(span, "_ended", True):
+                    items.append(span)
+                else:
+                    still_ending.append(span)
+            self._queue.extendleft(reversed(still_ending))
         return items
 
     def _export(self, spans: Iterable[Span]) -> None:
-        """
-        Export spans to exporter.
-        
-        Spans should be ended by the time they're flushed from the queue.
-        We filter out any spans that aren't ended yet.
-        """
+        """Export ended spans to exporter."""
         if self.exporter is None:
             return
-        
+
         try:
-            # Filter to only ended spans
-            ended_spans = [span for span in spans if span._ended]
-            
-            if not ended_spans:
-                return
-            
             # Export spans - exporter will handle conversion if needed
-            self.exporter.export(ended_spans)
+            self.exporter.export(list(spans))
         except Exception as e:
             # Export errors are swallowed; resilience over strictness.
             import traceback
