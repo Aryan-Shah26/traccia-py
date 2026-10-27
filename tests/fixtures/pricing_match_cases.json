@@ -62,7 +62,12 @@
     "claude-3-7-sonnet-20250219": {"prompt": 0.003, "completion": 0.015, "_provider": "anthropic"},
     "deepinfra/anthropic/claude-3-7-sonnet-latest": {"prompt": 0.0033, "completion": 0.0165, "_provider": "deepinfra"},
     "vercel_ai_gateway/anthropic/claude-3-7-sonnet": {"prompt": 0.003, "completion": 0.015, "_provider": "vercel_ai_gateway"},
-    "azure/us/o1-mini-2024-09-12": {"prompt": 0.00121, "completion": 0.00484, "_provider": "azure"}
+    "azure/us/o1-mini-2024-09-12": {"prompt": 0.00121, "completion": 0.00484, "_provider": "azure"},
+    "claude-3-opus-20240229": {"prompt": 0.015, "completion": 0.075, "_provider": "anthropic"},
+    "vertex_ai/claude-3-opus": {"prompt": 0.015, "completion": 0.075, "_provider": "vertex_ai-anthropic_models"},
+    "vercel_ai_gateway/anthropic/claude-3-opus": {"prompt": 0.015, "completion": 0.075, "_provider": "vercel_ai_gateway"},
+    "claude-sonnet-4-20250514": {"prompt": 0.003, "completion": 0.015, "_provider": "anthropic"},
+    "vertex_ai/claude-3-5-haiku": {"prompt": 0.001, "completion": 0.005, "_provider": "vertex_ai-anthropic_models"}
   },
   "cases": [
     {"model": "gpt-4o", "vendor": null, "key": "gpt-4o", "kind": "exact"},
@@ -125,8 +130,14 @@
     {"model": "devstral-small", "vendor": null, "key": "vercel_ai_gateway/mistral/devstral-small", "kind": "base"},
     {"model": "claude-4-opus", "vendor": null, "key": "deepinfra/anthropic/claude-4-opus", "kind": "base"},
     {"model": "claude-4-sonnet", "vendor": null, "key": "deepinfra/anthropic/claude-4-sonnet", "kind": "base"},
-    {"model": "claude-3-7-sonnet-latest", "vendor": null, "key": "deepinfra/anthropic/claude-3-7-sonnet-latest", "kind": "base"},
+    {"model": "claude-3-7-sonnet-latest", "vendor": null, "key": "claude-3-7-sonnet-20250219", "kind": "base"},
     {"model": "mistral-medium-latest", "vendor": "openai", "key": "mistral/mistral-medium-latest", "kind": "base"},
-    {"model": "mistral-large-latest", "vendor": "mistral", "key": "mistral/mistral-large-latest", "kind": "base"}
+    {"model": "mistral-large-latest", "vendor": "mistral", "key": "mistral/mistral-large-latest", "kind": "base"},
+    {"model": "claude-3-7-sonnet-latest", "vendor": "anthropic", "key": "claude-3-7-sonnet-20250219", "kind": "base"},
+    {"model": "claude-3-opus", "vendor": null, "key": "claude-3-opus-20240229", "kind": "base"},
+    {"model": "claude-3-opus", "vendor": "vertex_ai", "key": "vertex_ai/claude-3-opus", "kind": "base"},
+    {"model": "claude-sonnet-4-0", "vendor": null, "key": "claude-sonnet-4-20250514", "kind": "base"},
+    {"model": "anthropic/claude-sonnet-4", "vendor": "anthropic", "key": "claude-sonnet-4-20250514", "kind": "base"},
+    {"model": "claude-3-5-haiku-latest", "vendor": null, "key": "vertex_ai/claude-3-5-haiku", "kind": "base"}
   ]
 }

@@ -39,6 +39,24 @@ _VENDOR_PROVIDERS = {
 # The SDKs' cost engines apply the same rule (STRICT_VENDORS).
 _STRICT_VENDORS = frozenset({"groq"})
 
+# First-party names the pricing table lists only under a dated key (from traccia-node's
+# MODEL_ALIASES). Looked up by _name; a target missing from the table changes nothing.
+_MODEL_ALIASES = {
+    "claude-3-opus": "claude-3-opus-20240229",
+    "claude-3-opus-latest": "claude-3-opus-20240229",
+    "claude-3-haiku": "claude-3-haiku-20240307",
+    "claude-3-5-haiku": "claude-3-5-haiku-20241022",
+    "claude-3-5-haiku-latest": "claude-3-5-haiku-20241022",
+    "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
+    "claude-3-5-sonnet-latest": "claude-3-5-sonnet-20241022",
+    "claude-3-7-sonnet": "claude-3-7-sonnet-20250219",
+    "claude-3-7-sonnet-latest": "claude-3-7-sonnet-20250219",
+    "claude-sonnet-4": "claude-sonnet-4-20250514",
+    "claude-sonnet-4-0": "claude-sonnet-4-20250514",
+    "claude-opus-4": "claude-opus-4-20250514",
+    "claude-opus-4-0": "claude-opus-4-20250514",
+}
+
 
 class PriceMatch(NamedTuple):
     key: str
@@ -112,6 +130,9 @@ def match_model(
 ) -> Optional[PriceMatch]:
     """Return the pricing key for *model*, or None. *vendor* is the span's llm.vendor."""
     keys = candidate_keys(model, table)
+    alias = _MODEL_ALIASES.get(_name(str(model))) if model and str(model).strip() else None
+    if alias in table and alias not in keys:
+        keys.append(alias)
     if not keys:
         return None
     model = str(model)
@@ -121,11 +142,12 @@ def match_model(
     def own(key: str) -> bool:
         return _in_family(_provider(key, table[key]), providers)
 
-    # The vendor's own keys first; then a key for the exact name (with its date or -latest)
-    # before the shortest key, also when the vendor has no key of its own.
+    # The vendor's own keys first; then the exact key, the alias target, a key for the exact
+    # name (with its date or -latest), and the shortest key, also when the vendor has no key
+    # of its own.
     key = min(
         keys,
-        key=lambda k: (not own(k), k != model, _name(k) != wanted, len(k), k),
+        key=lambda k: (not own(k), k != model, k != alias, _name(k) != wanted, len(k), k),
     )
     if not own(key) and str(vendor or "").strip().lower() in _STRICT_VENDORS:
         return None
