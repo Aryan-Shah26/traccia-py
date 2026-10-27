@@ -75,6 +75,10 @@ DEFAULT_PRICING = BUNDLED_PRICING
 # applies the same rule.
 STRICT_VENDORS = frozenset({"groq"})
 
+# Set by pricing_config on entries from an env or programmatic pricing override. An override is
+# the user's price for that model name, so it wins even for a strict vendor.
+OVERRIDE_FLAG = "_override"
+
 _REGION = re.compile(r"^(?:us|eu|apac|au|ca|jp|global|us-gov)\.")
 _SUFFIX = re.compile(r"(?:-\d{4}-\d{2}-\d{2}|-\d{8}|-latest)$")
 
@@ -120,18 +124,45 @@ def _vendor_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, Lis
     return index
 
 
-def _lookup_vendor_price(
-    model: str, table: Dict[str, Dict[str, Any]], vendor: str
+# The last table indexed for overrides: (table, its size, base name -> keys).
+_override_index: Tuple[Any, int, Dict[str, List[str]]] = (None, 0, {})
+
+
+def _override_keys(table: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+    global _override_index
+    cached, size, index = _override_index
+    if cached is table and size == len(table):
+        return index
+    index = {}
+    for key, entry in table.items():
+        if isinstance(entry, dict) and entry.get(OVERRIDE_FLAG):
+            index.setdefault(_base_name(key), []).append(key)
+    _override_index = (table, len(table), index)
+    return index
+
+
+def _match_base_name(
+    model: str, table: Dict[str, Dict[str, Any]], index: Dict[str, List[str]]
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """The vendor's own entry for *model*: a vendor key with the same base name (lower-cased,
-    without the provider path, a region, or a date or -latest suffix), the key for the exact
-    dated name first, then the shortest. None when the vendor has no such key."""
+    """A key in *index* with the same base name as *model* (lower-cased, without the provider
+    path, a region, or a date or -latest suffix), the key for the exact dated name first, then
+    the shortest. None when there is no such key."""
     wanted = _name(str(model))
-    keys = _vendor_keys(table, vendor).get(_SUFFIX.sub("", wanted)) if wanted else None
+    keys = index.get(_SUFFIX.sub("", wanted)) if wanted else None
     if not keys:
         return None
     key = min(keys, key=lambda k: (_name(k) != wanted, len(k), k))
     return key, table[key]
+
+
+def _lookup_vendor_price(
+    model: str, table: Dict[str, Dict[str, Any]], vendor: str
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """A user override for *model* first, then the vendor's own entry (see _match_base_name).
+    None when neither exists."""
+    return _match_base_name(model, table, _override_keys(table)) or _match_base_name(
+        model, table, _vendor_keys(table, vendor)
+    )
 
 
 def _lookup_price(
@@ -140,8 +171,9 @@ def _lookup_price(
     """
     Return (matched_key, price_dict) for a given model name.
 
-    A call from a vendor in STRICT_VENDORS is priced only from that vendor's entries (see
-    _lookup_vendor_price). Otherwise the vendor is not used, and matching supports:
+    A call from a vendor in STRICT_VENDORS is priced from a user override for the model, else
+    only from that vendor's entries (see _lookup_vendor_price). Otherwise the vendor is not
+    used, and matching supports:
     - Exact match (case-sensitive)
     - Lowercase match
     - Longest-prefix match for version-suffixed names:

@@ -589,3 +589,55 @@ class TestStrictVendorPricing:
         span.set_attribute.side_effect = lambda k, v: span.attributes.__setitem__(k, v)
         CostAnnotatingProcessor(pricing_table=GROQ_TABLE).on_end(span)
         assert "llm.cost.usd" not in span.attributes
+
+
+# ---------------------------------------------------------------------------
+# An explicit override wins over a strict vendor's bundled entry
+# ---------------------------------------------------------------------------
+
+LLAMA = "llama-3.3-70b-versatile"
+LLAMA_OVERRIDE = {LLAMA: {"prompt": 1.0, "completion": 2.0}}  # $3.00 for 1K in + 1K out
+
+
+class TestOverridesWinForStrictVendors:
+    def test_programmatic_override_prices_a_groq_call(self, monkeypatch):
+        from traccia.pricing_config import load_pricing_with_source
+        from traccia.processors.cost_engine import compute_cost, match_pricing_model_key
+
+        monkeypatch.delenv("TRACCIA_PRICING_OVERRIDE_JSON", raising=False)
+        monkeypatch.delenv("AGENT_DASHBOARD_PRICING_JSON", raising=False)
+        table, source, _ = load_pricing_with_source(LLAMA_OVERRIDE)
+        assert source == "override"
+        assert match_pricing_model_key(LLAMA, table, "groq") == LLAMA
+        assert compute_cost(LLAMA, 1000, 1000, table, vendor="groq") == pytest.approx(3.0)
+        # Groq's own name for the model is the same model.
+        assert compute_cost(f"groq/{LLAMA}", 1000, 1000, table, vendor="groq") == pytest.approx(3.0)
+
+    def test_env_override_prices_a_groq_call(self, monkeypatch):
+        from traccia.pricing_config import load_pricing_with_source
+        from traccia.processors.cost_engine import compute_cost
+
+        monkeypatch.setenv("TRACCIA_PRICING_OVERRIDE_JSON", json.dumps(LLAMA_OVERRIDE))
+        table, source, _ = load_pricing_with_source()
+        assert source == "env"
+        assert compute_cost(LLAMA, 1000, 1000, table, vendor="groq") == pytest.approx(3.0)
+
+    def test_without_an_override_groq_keeps_its_bundled_price(self, monkeypatch):
+        from traccia.pricing_config import load_pricing_with_source
+        from traccia.processors.cost_engine import compute_cost
+
+        monkeypatch.delenv("TRACCIA_PRICING_OVERRIDE_JSON", raising=False)
+        monkeypatch.delenv("AGENT_DASHBOARD_PRICING_JSON", raising=False)
+        table, _, _ = load_pricing_with_source()
+        assert compute_cost(LLAMA, 1000, 1000, table, vendor="groq") == pytest.approx(0.00138)
+
+    def test_an_override_for_another_model_does_not_leak_into_groq(self, monkeypatch):
+        from traccia.pricing_config import load_pricing_with_source
+        from traccia.processors.cost_engine import match_pricing_model_key
+
+        monkeypatch.delenv("TRACCIA_PRICING_OVERRIDE_JSON", raising=False)
+        monkeypatch.delenv("AGENT_DASHBOARD_PRICING_JSON", raising=False)
+        table, _, _ = load_pricing_with_source({"gemma2-9b-it": {"prompt": 1.0, "completion": 1.0}})
+        # An explicit override is the user's price for that model name, whoever serves it.
+        assert match_pricing_model_key("gemma2-9b-it", table, "groq") == "gemma2-9b-it"
+        assert match_pricing_model_key(LLAMA, table, "groq") == f"groq/{LLAMA}"
