@@ -81,6 +81,16 @@ class TestIndexCache:
         assert match_model("acme/model-a", a).key == "model-a"
         assert match_model("acme/model-a", b) is None
 
+    def test_key_removed_in_place_with_the_same_size(self):
+        table = {"gpt-4o": {"prompt": 1}, "azure/gpt-4o": {"prompt": 2}}
+        assert match_model("gpt-4o", table).key == "gpt-4o"
+        del table["gpt-4o"]
+        table["other-model"] = {"prompt": 3}  # same len: the cached index is reused
+        assert match_model("gpt-4o", table).key == "azure/gpt-4o"
+        del table["azure/gpt-4o"]
+        table["another-model"] = {"prompt": 4}
+        assert match_model("gpt-4o", table) is None
+
 
 # Real model ids as each SDK reports them, against the bundled LiteLLM snapshot.
 BUNDLED_CASES = [

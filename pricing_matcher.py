@@ -101,7 +101,8 @@ def candidate_keys(model: Optional[str], table: Mapping[str, Any]) -> List[str]:
     if not model or not table or not str(model).strip():
         return []
     base = base_name(str(model))
-    return list(_index(table).get(base, [])) if base else []
+    # The index can be stale for a table edited in place without changing size.
+    return [k for k in _index(table).get(base, []) if k in table] if base else []
 
 
 def match_model(
