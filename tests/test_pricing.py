@@ -655,3 +655,24 @@ class TestOverridesWinForStrictVendors:
         # An override that names Groq, or names no provider, is used.
         table, _, _ = load_pricing_with_source({LLAMA: {"prompt": 1.0, "completion": 2.0, "_provider": "groq"}})
         assert compute_cost(LLAMA, 1000, 1000, table, vendor="groq") == pytest.approx(3.0)
+
+    @pytest.mark.parametrize(
+        "model, override_key, used",
+        [
+            (LLAMA, LLAMA, True),
+            (LLAMA, f"groq/{LLAMA}", True),
+            (LLAMA, f"together_ai/{LLAMA}", False),  # the provider is only in the key
+            ("openai/gpt-oss-120b", "openai/gpt-oss-120b", True),  # "openai" is the model's org
+            ("openai/gpt-oss-120b", "gpt-oss-120b", True),
+            ("openai/gpt-oss-120b", "groq/openai/gpt-oss-120b", True),
+            ("openai/gpt-oss-120b", "together_ai/openai/gpt-oss-120b", False),
+        ],
+    )
+    def test_an_override_key_path_naming_another_provider_is_skipped(self, monkeypatch, model, override_key, used):
+        from traccia.pricing_config import load_pricing_with_source
+        from traccia.processors.cost_engine import match_pricing_model_key
+
+        monkeypatch.delenv("TRACCIA_PRICING_OVERRIDE_JSON", raising=False)
+        monkeypatch.delenv("AGENT_DASHBOARD_PRICING_JSON", raising=False)
+        table, _, _ = load_pricing_with_source({override_key: {"prompt": 1.0, "completion": 1.0}})
+        assert (match_pricing_model_key(model, table, "groq") == override_key) is used

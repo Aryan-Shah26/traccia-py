@@ -15,7 +15,7 @@ import importlib.resources
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -97,14 +97,19 @@ def _strict_vendor(vendor: Optional[str]) -> Optional[str]:
     return v if v in STRICT_VENDORS else None
 
 
+def _is_family(provider: str, vendor: str) -> bool:
+    """Whether *provider* is the vendor, or a variant after "_" or "-" (as the platform's
+    matcher counts provider families)."""
+    p = provider.lower()
+    return p == vendor or p.startswith(vendor + "_") or p.startswith(vendor + "-")
+
+
 def _in_vendor_family(key: str, entry: Any, vendor: str) -> bool:
-    """Whether the entry is the vendor's: its provider is the vendor, or a variant after "_"
-    or "-" (as the platform's matcher counts provider families)."""
+    """Whether the entry is the vendor's, by its provider or else its key's first segment."""
     provider = (entry.get("_provider") or entry.get("provider")) if isinstance(entry, dict) else None
     if not provider and "/" in key:
         provider = key.split("/", 1)[0]
-    p = str(provider or "").lower()
-    return p == vendor or p.startswith(vendor + "_") or p.startswith(vendor + "-")
+    return _is_family(str(provider or ""), vendor)
 
 
 # The last table indexed for a vendor: (table, its size, vendor, base name -> keys).
@@ -139,8 +144,8 @@ def _override_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, L
     for key, entry in table.items():
         if not (isinstance(entry, dict) and entry.get(OVERRIDE_FLAG)):
             continue
-        provider = str(entry.get("_provider") or entry.get("provider") or "").lower()
-        if provider and not (provider == vendor or provider.startswith((vendor + "_", vendor + "-"))):
+        provider = str(entry.get("_provider") or entry.get("provider") or "")
+        if provider and not _is_family(provider, vendor):
             continue
         index.setdefault(_base_name(key), []).append(key)
     _override_index = (table, len(table), vendor, index)
@@ -148,27 +153,50 @@ def _override_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, L
 
 
 def _match_base_name(
-    model: str, table: Dict[str, Dict[str, Any]], index: Dict[str, List[str]]
+    model: str,
+    table: Dict[str, Dict[str, Any]],
+    index: Dict[str, List[str]],
+    usable: Optional[Callable[[str], bool]] = None,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """A key in *index* with the same base name as *model* (lower-cased, without the provider
-    path, a region, or a date or -latest suffix), the key for the exact dated name first, then
-    the shortest. None when there is no such key."""
+    """A key in *index* (and passing *usable*) with the same base name as *model* (lower-cased,
+    without the provider path, a region, or a date or -latest suffix), the key for the exact
+    dated name first, then the shortest. None when there is no such key."""
     wanted = _name(str(model))
     keys = index.get(_SUFFIX.sub("", wanted)) if wanted else None
+    if keys and usable:
+        keys = [k for k in keys if usable(k)]
     if not keys:
         return None
     key = min(keys, key=lambda k: (_name(k) != wanted, len(k), k))
     return key, table[key]
 
 
+def _override_path_fits(key: str, entry: Any, model: str, vendor: str) -> bool:
+    """Whether an override's key can be for the vendor's *model*. A key's path may be the
+    model's org ("openai/gpt-oss-120b") or a provider ("together_ai/llama-3.3-70b"): it fits
+    when it is empty, the model's own path, or the vendor's family followed by that path. An
+    explicit _provider/provider (checked in _override_keys) decides on its own."""
+    if isinstance(entry, dict) and (entry.get("_provider") or entry.get("provider")):
+        return True
+    m = model.strip().lower()
+    if m.startswith(vendor + "/"):
+        m = m[len(vendor) + 1 :]
+    model_path = m.split("/")[:-1]
+    path = key.strip().lower().split("/")[:-1]
+    return not path or path == model_path or (path[1:] == model_path and _is_family(path[0], vendor))
+
+
 def _lookup_vendor_price(
     model: str, table: Dict[str, Dict[str, Any]], vendor: str
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """A user override for *model* (see _override_keys) first, then the vendor's own entry
-    (see _match_base_name). None when neither exists."""
-    return _match_base_name(model, table, _override_keys(table, vendor)) or _match_base_name(
-        model, table, _vendor_keys(table, vendor)
-    )
+    """A user override for *model* (see _override_keys and _override_path_fits) first, then
+    the vendor's own entry (see _match_base_name). None when neither exists."""
+    return _match_base_name(
+        model,
+        table,
+        _override_keys(table, vendor),
+        lambda key: _override_path_fits(key, table[key], model, vendor),
+    ) or _match_base_name(model, table, _vendor_keys(table, vendor))
 
 
 def _lookup_price(
