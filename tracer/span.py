@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import traceback
 from enum import Enum
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from opentelemetry.trace import Span as OTelSpan, Status, StatusCode
 from opentelemetry.trace import set_span_in_context
@@ -137,10 +137,75 @@ class Span:
 
     @property
     def events(self) -> List[Dict[str, Any]]:
-        """Get span events (read-only)."""
-        # OTel doesn't expose events on active span
-        # Return empty list for now
-        return []
+        """Get a read-only snapshot of the events recorded on the underlying OTel span."""
+        try:
+            return [
+                {
+                    "name": ev.name,
+                    "attributes": dict(ev.attributes or {}),
+                    "timestamp_ns": ev.timestamp,
+                }
+                for ev in getattr(self._otel_span, "_events", None) or ()
+            ]
+        except Exception:
+            return []
+
+    def _rewrite_otel_events(
+        self, transform: Callable[[Dict[str, Any]], Dict[str, Any]]
+    ) -> int:
+        """
+        Replace the attributes of every event stored on the OTel span (including
+        events added via other wrappers or the raw OTel API) with ``transform(attrs)``.
+
+        Events are replaced in place, so OTel's event limits and dropped counts are
+        preserved. Must be called before the OTel span ends. Returns events changed.
+        """
+        otel_span = self._otel_span
+        events = getattr(otel_span, "_events", None)
+        dq = getattr(events, "_dq", None)
+        if dq is None:
+            return 0
+        try:
+            from opentelemetry.sdk.trace import Event
+            from opentelemetry.attributes import BoundedAttributes
+        except Exception:
+            return 0
+        limits = getattr(otel_span, "_limits", None)
+        changed = 0
+        with events._lock:
+            for i, ev in enumerate(list(dq)):
+                attrs = dict(ev.attributes or {})
+                if not attrs:
+                    continue
+                new_attrs = transform(attrs)
+                if new_attrs == attrs:
+                    continue
+                dq[i] = Event(
+                    name=ev.name,
+                    attributes=BoundedAttributes(
+                        getattr(limits, "max_event_attributes", None),
+                        new_attrs,
+                        max_value_len=getattr(limits, "max_attribute_length", None),
+                        immutable=True,
+                    ),
+                    timestamp=ev.timestamp,
+                )
+                changed += 1
+        return changed
+
+    def _rewrite_otel_status_description(self, transform: Callable[[str], str]) -> bool:
+        """Rewrite the OTel span's status description (set via any wrapper or raw OTel)."""
+        status = getattr(self._otel_span, "_status", None)
+        description = getattr(status, "description", None)
+        if not description:
+            return False
+        new_description = transform(description)
+        if new_description == description:
+            return False
+        self._otel_span._status = Status(status_code=status.status_code, description=new_description)
+        if self.status_description == description:
+            self.status_description = new_description
+        return True
 
     @property
     def duration_ns(self) -> Optional[int]:

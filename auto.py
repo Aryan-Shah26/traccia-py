@@ -576,8 +576,6 @@ def start_tracing(
             set_resolver(CostResolver(pricing_table, pricing_source, pricing_generated_at))
         except Exception:
             pass
-    if enable_span_logging:
-        provider.add_span_processor(LoggingSpanProcessor())
     # Agent enrichment: use init-time identity as default so span-level overrides win over resource/defaults.
     provider.add_span_processor(
         AgentEnrichmentProcessor(
@@ -658,6 +656,10 @@ def start_tracing(
                 "Could not register RedactionSpanProcessor: %s",
                 _red_exc,
             )
+
+    # Log after enrichment and redaction so span logs never contain unredacted values.
+    if enable_span_logging:
+        provider.add_span_processor(LoggingSpanProcessor())
 
     # For OTLP exporter, use OTel's BatchSpanProcessor directly
     # For non-OTLP exporters (console/file), use our custom BatchSpanProcessor

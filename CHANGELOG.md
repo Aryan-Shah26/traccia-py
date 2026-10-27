@@ -22,6 +22,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - No more prefix matching: a model name that matches no pricing key after the steps above (for example a fine-tuned `gpt-4o-mini-ft-…`) gets no cost instead of the price of a model whose name it starts with
 
+## [0.1.33] - 2026-10-21
+
+### Added
+- `traccia eval SCRIPT --output PATH --dataset NAME` runs a task script, saves an experiment, and writes `summary.json`. Exit 0 with no pass-rate bar is Execution Only (`quality_gate` false). `--min-pass-rate` or `--max-drop` makes a Quality Gate. `--max-drop 0.05` is five percentage points. `--max-task-cost-increase`, `--max-judge-cost-increase`, and `--max-latency-increase` are relative: `0.2` is 20 percent. Evidence failures exit 3 before a low score is considered. Exit 2 is a bad command or baseline, 4 is a failed save, 5 is a summary file that could not be written.
+- `local:` scorers have no definition hash, so `--max-drop` ends in `scorer_definition_unhashed` instead of a green quality gate. A renamed platform scorer still matches its baseline by scorer id. A scorer selected by id is grouped under the name on its result.
+- Each Jev question is its own gate, named `{scorer}:{question}`.
+- `traccia eval` sends provider API keys from the environment (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or `GOOGLE_API_KEY`, `GROQ_API_KEY`, `TYPESAFE_API_KEY`, or `TRACCIA_PROVIDER_KEYS`) and does not write them into the summary. A task file that uses a dataclass with postponed annotations loads.
+- Task cost includes OpenTelemetry attribute mappings and priced provider child spans on the SDK tracer provider.
+- `create_experiment` retries a 5xx. The client-generated experiment id makes the retry safe.
+- `evaluate()` keeps scorer `status`. An execution error stays `status: error` with no score, including remote platform scorers. Task cost is separate from judge cost.
+
+### Changed
+- Development status on PyPI is Production/Stable.
+- Passing `prompt` without `prompt_version` or `prompt_label` still attaches the production label and writes a deprecation warning. The next SDK release removes that default. `traccia eval` does not use that default: pass `--prompt` with `--prompt-version` or `--prompt-label`.
+
+### Fixed
+- With `redact_pii=True`, span events, exceptions, arrays, and nested values are redacted before export. A nested value inherits its parent key, so `{"result": {"answer": ...}}` is redacted in the default mode. `redact_all_strings` is honored, and error status text is scrubbed.
+- Span logging runs after redaction, so `enable_span_logging=True` does not print the original values.
+
 ## [0.1.32] - 2026-10-08
 
 ### Added
