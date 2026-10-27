@@ -14,9 +14,17 @@ from __future__ import annotations
 import importlib.resources
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from traccia.pricing_matcher import match_model
+from traccia.pricing_matcher import (
+    PriceMatch,
+    _in_family,
+    _name,
+    _provider,
+    _vendor_providers,
+    base_name,
+    match_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +78,66 @@ DEFAULT_PRICING = BUNDLED_PRICING
 # Model-name matching
 # ---------------------------------------------------------------------------
 
+# Set by pricing_config on entries from an env or programmatic pricing override. An override is
+# the user's price for that model name, so it wins over the vendor's bundled entries.
+OVERRIDE_FLAG = "_override"
+
+# The last table indexed for overrides: (table, its size, base name -> keys).
+_override_index: Tuple[Any, int, Dict[str, List[str]]] = (None, 0, {})
+
+
+def _override_keys(table: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+    global _override_index
+    cached, size, index = _override_index
+    if cached is table and size == len(table):
+        return index
+    index = {}
+    for key, entry in table.items():
+        if isinstance(entry, dict) and entry.get(OVERRIDE_FLAG):
+            index.setdefault(base_name(key), []).append(key)
+    _override_index = (table, len(table), index)
+    return index
+
+
+def _override_fits(key: str, entry: Any, model: str, families: tuple) -> bool:
+    """Whether an override can be for the vendor's *model*. An explicit _provider/provider
+    must be in the vendor's provider family. Otherwise the key's path (it may be the model's
+    org, "openai/gpt-oss-120b", or a provider, "together_ai/llama-3.3-70b") must be empty, the
+    model's own path, or a provider of the vendor's family followed by that path."""
+    explicit = (entry.get("_provider") or entry.get("provider")) if isinstance(entry, dict) else None
+    if explicit:
+        return _in_family(str(explicit).lower(), families)
+    model_path = model.strip().lower().split("/")[:-1]
+    if model_path and _in_family(model_path[0], families):
+        model_path = model_path[1:]
+    path = key.strip().lower().split("/")[:-1]
+    return not path or path == model_path or (path[1:] == model_path and _in_family(path[0], families))
+
+
+def _match(model: str, table: Dict[str, Dict[str, Any]], vendor: Optional[str] = None) -> Optional[PriceMatch]:
+    """The pricing key for *model*: for a call with a vendor, a user override that fits it
+    (see _override_fits; same name rules as the matcher, the exact dated name first), else
+    traccia.pricing_matcher.match_model."""
+    families = _vendor_providers(vendor)
+    if families and model and str(model).strip():
+        model = str(model)
+        keys = [
+            k
+            for k in _override_keys(table).get(base_name(model), [])
+            if _override_fits(k, table[k], model, families)
+        ]
+        if keys:
+            wanted = _name(model)
+            key = min(keys, key=lambda k: (k != model, _name(k) != wanted, len(k), k))
+            return PriceMatch(key, "exact" if key == model else "base", _provider(key, table[key]))
+    return match_model(model, table, vendor)
+
+
 def _lookup_price(
     model: str, table: Dict[str, Dict[str, Any]], vendor: Optional[str] = None
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Return (matched_key, price_dict) for a given model name; see traccia.pricing_matcher."""
-    matched = match_model(model, table, vendor)
+    """Return (matched_key, price_dict) for a given model name; see _match."""
+    matched = _match(model, table, vendor)
     if matched is None:
         return None
     return matched.key, table[matched.key]
@@ -87,7 +150,7 @@ def match_pricing_model_key(
 ) -> Optional[str]:
     """Return the pricing table key that would be used for *model*, if any."""
     table = pricing_table if pricing_table is not None else BUNDLED_PRICING
-    matched = match_model(model, table, vendor)
+    matched = _match(model, table, vendor)
     return matched.key if matched else None
 
 
@@ -115,7 +178,7 @@ def compute_cost_detail(
     (``match_kind``: exact | base) and its ``provider``.
     """
     table = pricing_table if pricing_table is not None else BUNDLED_PRICING
-    matched = match_model(model, table, vendor)
+    matched = _match(model, table, vendor)
     if not matched:
         return None
     price = table[matched.key]
