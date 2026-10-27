@@ -196,3 +196,40 @@ def test_flush_waits_for_a_slow_settle(server, monkeypatch):
     threading.Timer(0.05, gate.set).start()
     flush_pending_settles()
     assert len(server.settles) == 1
+
+
+def _run_with_timeout(fn, timeout=5.0):
+    """Run fn on a thread, in this context; True when it returned within timeout (False: it
+    deadlocked)."""
+    import contextvars
+    import threading
+
+    ctx = contextvars.copy_context()
+    done = threading.Event()
+    threading.Thread(target=lambda: (ctx.run(fn), done.set()), daemon=True).start()
+    return done.wait(timeout)
+
+
+def test_a_settle_started_while_the_settle_lock_is_held_does_not_deadlock(server):
+    # A garbage-collected stream settles from its finalizer, which can run on a thread that
+    # is inside the settle lock (flush_pending_settles, _settle_pool, _settle_done).
+    def settle_inside_the_lock():
+        with pep_mod._settle_lock:
+            finish_llm_call_in_background({"obligations": {"reserved_usd": 0.25}}, actual_usd=0.01)
+
+    assert _run_with_timeout(settle_inside_the_lock)
+    assert len(server.settles) == 1
+
+
+def test_a_settle_at_interpreter_exit_runs_on_the_calling_thread(server, monkeypatch):
+    # After interpreter shutdown starts, the pool refuses new work; a stream finalized at exit
+    # must still settle rather than drop its reservation.
+    from concurrent.futures import ThreadPoolExecutor
+
+    closed = ThreadPoolExecutor(max_workers=1)
+    closed.shutdown()
+    monkeypatch.setattr(pep_mod, "_settle_pool", lambda: closed)
+    finish_llm_call_in_background({"obligations": {"reserved_usd": 0.25}}, actual_usd=0.01)
+    [body] = server._settles  # already sent: no background work to wait for
+    assert body["actual_usd"] == 0.01
+    assert body["agent_id"] == "support"

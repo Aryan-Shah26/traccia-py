@@ -509,7 +509,9 @@ def finish_llm_call(
 
 _settle_executor: Optional[ThreadPoolExecutor] = None
 _pending_settles: Set[Future] = set()
-_settle_lock = threading.Lock()
+# Reentrant: a garbage-collected stream settles from its finalizer, which can run on a thread
+# already inside this lock.
+_settle_lock = threading.RLock()
 
 
 def _settle_pool() -> ThreadPoolExecutor:
@@ -535,7 +537,12 @@ def finish_llm_call_in_background(decision: Optional[Dict[str, Any]], **kwargs: 
     if reserved_usd(decision) is None:
         return  # nothing was reserved, so there is nothing to settle
     ctx = contextvars.copy_context()
-    future = _settle_pool().submit(ctx.run, finish_llm_call, decision, **kwargs)
+    try:
+        future = _settle_pool().submit(ctx.run, finish_llm_call, decision, **kwargs)
+    except RuntimeError:
+        # The interpreter is shutting down (e.g. a stream finalized at exit): settle here.
+        ctx.run(finish_llm_call, decision, **kwargs)
+        return
     with _settle_lock:
         _pending_settles.add(future)
     future.add_done_callback(_settle_done)
