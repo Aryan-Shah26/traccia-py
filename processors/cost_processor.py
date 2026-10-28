@@ -6,7 +6,7 @@ import logging
 import threading
 from typing import Any, Dict, Optional
 
-from traccia.processors.cost_engine import compute_cost_detail, match_pricing_model_key
+from traccia.processors.cost_engine import compute_cost_detail
 from traccia.tracer.provider import SpanProcessor
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,8 @@ class CostAnnotatingProcessor(SpanProcessor):
       - llm.usage.source             — where token counts came from (was llm.cost.source)
       - llm.pricing.source           — which pricing layer was used
       - llm.pricing.model_key        — the pricing table key matched
+      - llm.pricing.match_kind       — how it matched: exact | base
+      - llm.pricing.provider         — pricing provider of the matched key, when known
       - llm.pricing.generated_at     — ISO timestamp of the pricing snapshot
       - llm.pricing.age_days         — integer age of the snapshot in days
       - llm.pricing.snapshot_version — source identifier of the snapshot
@@ -140,9 +142,10 @@ class CostAnnotatingProcessor(SpanProcessor):
 
         span.set_attribute("llm.pricing.source", self.pricing_source)
 
-        key = match_pricing_model_key(model, self.pricing_table, vendor)
-        if key:
-            span.set_attribute("llm.pricing.model_key", key)
+        span.set_attribute("llm.pricing.model_key", detail["model_key"])
+        span.set_attribute("llm.pricing.match_kind", detail["match_kind"])
+        if detail["provider"]:
+            span.set_attribute("llm.pricing.provider", detail["provider"])
 
         # Snapshot provenance — lets the platform know how old the client's rates were.
         span.set_attribute("llm.pricing.generated_at", self.pricing_generated_at)

@@ -14,8 +14,17 @@ from __future__ import annotations
 import importlib.resources
 import json
 import logging
-import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from traccia.pricing_matcher import (
+    PriceMatch,
+    _in_family,
+    _name,
+    _provider,
+    _vendor_providers,
+    base_name,
+    match_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,187 +78,69 @@ DEFAULT_PRICING = BUNDLED_PRICING
 # Model-name matching
 # ---------------------------------------------------------------------------
 
-# llm.vendor values set only by that provider's own SDK, which calls no other provider. Their
-# calls are priced only from that provider's entries, never from another provider's entry for
-# the same model name, which can be priced very differently. The platform's pricing matcher
-# applies the same rule.
-STRICT_VENDORS = frozenset({"groq"})
-
 # Set by pricing_config on entries from an env or programmatic pricing override. An override is
-# the user's price for that model name, so it wins even for a strict vendor.
+# the user's price for that model name, so it wins over the vendor's bundled entries.
 OVERRIDE_FLAG = "_override"
 
-_REGION = re.compile(r"^(?:us|eu|apac|au|ca|jp|global|us-gov)\.")
-_SUFFIX = re.compile(r"(?:-\d{4}-\d{2}-\d{2}|-\d{8}|-latest)$")
+# The last table indexed for overrides: (table, its size, base name -> keys).
+_override_index: Tuple[Any, int, Dict[str, List[str]]] = (None, 0, {})
 
 
-def _name(name: str) -> str:
-    """Lower-cased, without the provider path or region; the date is kept."""
-    return _REGION.sub("", name.strip().lower().rsplit("/", 1)[-1])
-
-
-def _base_name(name: str) -> str:
-    return _SUFFIX.sub("", _name(name))
-
-
-def _strict_vendor(vendor: Optional[str]) -> Optional[str]:
-    v = str(vendor or "").strip().lower()
-    return v if v in STRICT_VENDORS else None
-
-
-def _is_family(provider: str, vendor: str) -> bool:
-    """Whether *provider* is the vendor, or a variant after "_" or "-" (as the platform's
-    matcher counts provider families)."""
-    p = provider.lower()
-    return p == vendor or p.startswith(vendor + "_") or p.startswith(vendor + "-")
-
-
-def _in_vendor_family(key: str, entry: Any, vendor: str) -> bool:
-    """Whether the entry is the vendor's, by its provider or else its key's first segment."""
-    provider = (entry.get("_provider") or entry.get("provider")) if isinstance(entry, dict) else None
-    if not provider and "/" in key:
-        provider = key.split("/", 1)[0]
-    return _is_family(str(provider or ""), vendor)
-
-
-# The last table indexed for a vendor: (table, its size, vendor, base name -> keys).
-_vendor_index: Tuple[Any, int, Optional[str], Dict[str, List[str]]] = (None, 0, None, {})
-
-
-def _vendor_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, List[str]]:
-    global _vendor_index
-    cached, size, cached_vendor, index = _vendor_index
-    if cached is table and size == len(table) and cached_vendor == vendor:
-        return index
-    index = {}
-    for key, entry in table.items():
-        if _in_vendor_family(key, entry, vendor):
-            index.setdefault(_base_name(key), []).append(key)
-    _vendor_index = (table, len(table), vendor, index)
-    return index
-
-
-# The last table indexed for overrides: (table, its size, vendor, base name -> keys).
-_override_index: Tuple[Any, int, Optional[str], Dict[str, List[str]]] = (None, 0, None, {})
-
-
-def _override_keys(table: Dict[str, Dict[str, Any]], vendor: str) -> Dict[str, List[str]]:
-    """Overrides usable for the vendor's calls: those naming no provider, or the vendor's.
-    Only an explicit _provider/provider counts; a key's path may be the model's org."""
+def _override_keys(table: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
     global _override_index
-    cached, size, cached_vendor, index = _override_index
-    if cached is table and size == len(table) and cached_vendor == vendor:
+    cached, size, index = _override_index
+    if cached is table and size == len(table):
         return index
     index = {}
     for key, entry in table.items():
-        if not (isinstance(entry, dict) and entry.get(OVERRIDE_FLAG)):
-            continue
-        provider = str(entry.get("_provider") or entry.get("provider") or "")
-        if provider and not _is_family(provider, vendor):
-            continue
-        index.setdefault(_base_name(key), []).append(key)
-    _override_index = (table, len(table), vendor, index)
+        if isinstance(entry, dict) and entry.get(OVERRIDE_FLAG):
+            index.setdefault(base_name(key), []).append(key)
+    _override_index = (table, len(table), index)
     return index
 
 
-def _match_base_name(
-    model: str,
-    table: Dict[str, Dict[str, Any]],
-    index: Dict[str, List[str]],
-    usable: Optional[Callable[[str], bool]] = None,
-) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """A key in *index* (and passing *usable*) with the same base name as *model* (lower-cased,
-    without the provider path, a region, or a date or -latest suffix), the key for the exact
-    dated name first, then the shortest. None when there is no such key."""
-    wanted = _name(str(model))
-    keys = index.get(_SUFFIX.sub("", wanted)) if wanted else None
-    if keys and usable:
-        keys = [k for k in keys if usable(k)]
-    if not keys:
-        return None
-    key = min(keys, key=lambda k: (_name(k) != wanted, len(k), k))
-    return key, table[key]
-
-
-def _override_path_fits(key: str, entry: Any, model: str, vendor: str) -> bool:
-    """Whether an override's key can be for the vendor's *model*. A key's path may be the
-    model's org ("openai/gpt-oss-120b") or a provider ("together_ai/llama-3.3-70b"): it fits
-    when it is empty, the model's own path, or the vendor's family followed by that path. An
-    explicit _provider/provider (checked in _override_keys) decides on its own."""
-    if isinstance(entry, dict) and (entry.get("_provider") or entry.get("provider")):
-        return True
-    m = model.strip().lower()
-    if m.startswith(vendor + "/"):
-        m = m[len(vendor) + 1 :]
-    model_path = m.split("/")[:-1]
+def _override_fits(key: str, entry: Any, model: str, families: tuple) -> bool:
+    """Whether an override can be for the vendor's *model*. An explicit _provider/provider
+    must be in the vendor's provider family. Otherwise the key's path (it may be the model's
+    org, "openai/gpt-oss-120b", or a provider, "together_ai/llama-3.3-70b") must be empty, the
+    model's own path, or a provider of the vendor's family followed by that path."""
+    explicit = (entry.get("_provider") or entry.get("provider")) if isinstance(entry, dict) else None
+    if explicit:
+        return _in_family(str(explicit).lower(), families)
+    model_path = model.strip().lower().split("/")[:-1]
+    if model_path and _in_family(model_path[0], families):
+        model_path = model_path[1:]
     path = key.strip().lower().split("/")[:-1]
-    return not path or path == model_path or (path[1:] == model_path and _is_family(path[0], vendor))
+    return not path or path == model_path or (path[1:] == model_path and _in_family(path[0], families))
 
 
-def _lookup_vendor_price(
-    model: str, table: Dict[str, Dict[str, Any]], vendor: str
-) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """A user override for *model* (see _override_keys and _override_path_fits) first, then
-    the vendor's own entry (see _match_base_name). None when neither exists."""
-    return _match_base_name(
-        model,
-        table,
-        _override_keys(table, vendor),
-        lambda key: _override_path_fits(key, table[key], model, vendor),
-    ) or _match_base_name(model, table, _vendor_keys(table, vendor))
+def _match(model: str, table: Dict[str, Dict[str, Any]], vendor: Optional[str] = None) -> Optional[PriceMatch]:
+    """The pricing key for *model*: for a call with a vendor, a user override that fits it
+    (see _override_fits; same name rules as the matcher, the exact dated name first), else
+    traccia.pricing_matcher.match_model."""
+    families = _vendor_providers(vendor)
+    if families and model and str(model).strip():
+        model = str(model)
+        keys = [
+            k
+            for k in _override_keys(table).get(base_name(model), [])
+            if _override_fits(k, table[k], model, families)
+        ]
+        if keys:
+            wanted = _name(model)
+            key = min(keys, key=lambda k: (k != model, _name(k) != wanted, len(k), k))
+            return PriceMatch(key, "exact" if key == model else "base", _provider(key, table[key]))
+    return match_model(model, table, vendor)
 
 
 def _lookup_price(
     model: str, table: Dict[str, Dict[str, Any]], vendor: Optional[str] = None
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
-    """
-    Return (matched_key, price_dict) for a given model name.
-
-    A call from a vendor in STRICT_VENDORS is priced from a user override for the model, else
-    only from that vendor's entries (see _lookup_vendor_price). Otherwise the vendor is not
-    used, and matching supports:
-    - Exact match (case-sensitive)
-    - Lowercase match
-    - Longest-prefix match for version-suffixed names:
-        e.g. "claude-3-opus-20240229" -> "claude-3-opus"
-             "gpt-4o-2024-08-06"      -> "gpt-4o"
-    """
-    if not model:
+    """Return (matched_key, price_dict) for a given model name; see _match."""
+    matched = _match(model, table, vendor)
+    if matched is None:
         return None
-    m = str(model).strip()
-    if not m:
-        return None
-    strict = _strict_vendor(vendor)
-    if strict:
-        return _lookup_vendor_price(m, table, strict)
-
-    if m in table:
-        return m, table[m]
-    ml = m.lower()
-    if ml in table:
-        return ml, table[ml]
-
-    # Provider-prefixed keys: grok-4.7 -> xai/grok-4.7, before prefix so grok-4 does not steal grok-4.7.
-    suffix_hits = []
-    for key, value in table.items():
-        tail = key.replace("\\", "/").rsplit("/", 1)[-1]
-        dot = tail.find(".")
-        if dot > 0:
-            head, rest = tail[:dot], tail[dot + 1 :]
-            if head.replace("-", "").isalpha() and "-" in rest:
-                tail = rest
-        if tail.lower() == ml:
-            suffix_hits.append((key, value))
-    if suffix_hits:
-        suffix_hits.sort(key=lambda item: len(item[0]))
-        return suffix_hits[0]
-
-    # Longest-key prefix wins to avoid "gpt-4" matching "gpt-4o".
-    for key in sorted(table.keys(), key=len, reverse=True):
-        if ml.startswith(key.lower()):
-            return key, table[key]
-
-    return None
+    return matched.key, table[matched.key]
 
 
 def match_pricing_model_key(
@@ -259,11 +150,8 @@ def match_pricing_model_key(
 ) -> Optional[str]:
     """Return the pricing table key that would be used for *model*, if any."""
     table = pricing_table if pricing_table is not None else BUNDLED_PRICING
-    matched = _lookup_price(model, table, vendor)
-    if not matched:
-        return None
-    key, _ = matched
-    return key
+    matched = _match(model, table, vendor)
+    return matched.key if matched else None
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +171,17 @@ def compute_cost_detail(
 
     ``cached_prompt`` and ``cache_write`` come from the LiteLLM snapshot.
     When a cache rate is missing, that portion uses the input rate and
-    ``cache_fallback`` is true. *vendor* is the span's ``llm.vendor`` (see
-    STRICT_VENDORS).
+    ``cache_fallback`` is true. *vendor* (the span's ``llm.vendor``) prefers that
+    provider's own price when several pricing keys fit the model name.
+
+    The result also names the matched key (``model_key``), how it matched
+    (``match_kind``: exact | base) and its ``provider``.
     """
     table = pricing_table if pricing_table is not None else BUNDLED_PRICING
-    matched = _lookup_price(model, table, vendor)
+    matched = _match(model, table, vendor)
     if not matched:
         return None
-    _, price = matched
+    price = table[matched.key]
     cost = (prompt_tokens / 1_000.0) * price.get("prompt", 0.0)
     cost += (completion_tokens / 1_000.0) * price.get("completion", 0.0)
     cache_fallback = False
@@ -306,7 +197,13 @@ def compute_cost_detail(
             rate = price.get("prompt", 0.0)
             cache_fallback = True
         cost += (cache_write_tokens / 1_000.0) * float(rate)
-    return {"cost": round(cost, 6), "cache_fallback": cache_fallback}
+    return {
+        "cost": round(cost, 6),
+        "cache_fallback": cache_fallback,
+        "model_key": matched.key,
+        "match_kind": matched.kind,
+        "provider": matched.provider,
+    }
 
 
 def compute_cost(
@@ -328,8 +225,7 @@ def compute_cost(
         pricing_table: Optional pricing table to use; defaults to BUNDLED_PRICING.
         cache_read_tokens: Tokens served from cache.
         cache_write_tokens: Tokens written to cache.
-        vendor: The span's ``llm.vendor``; a vendor in STRICT_VENDORS is priced only
-            from its own entries.
+        vendor: The span's ``llm.vendor``; prefers that provider's own price.
 
     Returns:
         Estimated cost in USD rounded to 6 decimal places, or None if the

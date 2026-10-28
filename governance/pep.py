@@ -454,7 +454,11 @@ def estimate_prompt_tokens(kwargs: Dict[str, Any]) -> Optional[int]:
     return _estimate_tokens(kwargs)
 
 
-def enforce_llm_call(kwargs: Dict[str, Any], *, vendor: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def enforce_llm_call(
+    kwargs: Dict[str, Any], vendor: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Check policy before an LLM call. *vendor* is the span's llm.vendor; Spend Cap
+    uses it to pick that provider's price."""
     if not runtime_config.pep_enabled():
         return None
     model = kwargs.get("model")
@@ -467,7 +471,6 @@ def enforce_llm_call(kwargs: Dict[str, Any], *, vendor: Optional[str] = None) ->
         "retrieval": _retrieval_context(trace_id),
     }
     if vendor:
-        # Picks that provider's price when the model name alone is ambiguous.
         context["vendor"] = vendor
     prompt = _prompt_context()
     if prompt:

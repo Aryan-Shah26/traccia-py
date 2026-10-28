@@ -148,8 +148,8 @@ def _compute_cost(
     model: Optional[str], prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0
 ) -> Optional[float]:
     """USD cost at Groq's price, or None when the pricing table has no Groq entry for the model
-    (the server then prices the tokens). Only Groq's own entries are used (see
-    cost_engine.STRICT_VENDORS), from the table spans are priced with, so the settled cost and
+    (the server then prices the tokens). Only Groq's own entries, or a user override that fits
+    them, are used (see pricing_matcher), from the table spans are priced with, so the settled cost and
     the span's llm.cost.usd agree. ``cached_tokens`` are part of ``prompt_tokens``."""
     if not model:
         return None

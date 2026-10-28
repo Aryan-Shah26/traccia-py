@@ -136,7 +136,7 @@ def load_pricing_with_source(
 
 
 def _mark_override(entries: Dict[str, Any]) -> Dict[str, Any]:
-    """Copies of the user's entries, flagged so a strict vendor's lookup still uses them."""
+    """Copies of the user's entries, flagged so vendor matching still uses them."""
     return {key: {**entry, OVERRIDE_FLAG: True} if isinstance(entry, dict) else entry for key, entry in entries.items()}
 
 
