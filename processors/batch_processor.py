@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -11,6 +12,8 @@ from traccia.processors.drop_policy import DEFAULT_DROP_POLICY, DropPolicy
 from traccia.processors.sampler import Sampler
 from traccia.tracer.provider import SpanProcessor
 from traccia.tracer.span import Span
+
+logger = logging.getLogger(__name__)
 
 
 class BatchSpanProcessor(SpanProcessor):
@@ -30,6 +33,7 @@ class BatchSpanProcessor(SpanProcessor):
         schedule_delay_millis: int = 5000,
         drop_policy: Optional[DropPolicy] = None,
         sampler: Optional[Sampler] = None,
+        shutdown_timeout_millis: int = 30_000,
     ) -> None:
         self.exporter = exporter
         self.max_queue_size = max_queue_size
@@ -37,11 +41,16 @@ class BatchSpanProcessor(SpanProcessor):
         self.schedule_delay = schedule_delay_millis / 1000.0
         self.drop_policy = drop_policy or DEFAULT_DROP_POLICY
         self.sampler = sampler
+        self.shutdown_timeout = shutdown_timeout_millis / 1000.0
 
         self._queue: Deque[Span] = deque()
         self._lock = threading.Lock()
         self._event = threading.Event()
         self._shutdown = False
+        # Exports in progress; shutdown() closes the exporter only when none are.
+        self._exports_idle = threading.Condition()
+        self._active_exports = 0
+        self._exporter_closed = False
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
@@ -90,12 +99,26 @@ class BatchSpanProcessor(SpanProcessor):
         self._event.set()
         self._worker.join(timeout=self.schedule_delay * 2)
         self.force_flush()
-        if self.exporter is not None and hasattr(self.exporter, "shutdown"):
-            try:
-                self.exporter.shutdown()
-            except Exception:
-                import traceback
-                traceback.print_exc()
+        if self.exporter is None or not hasattr(self.exporter, "shutdown"):
+            return
+        # The timed join() can return while the worker is still exporting.
+        # Closing the exporter under that export would lose its batch.
+        with self._exports_idle:
+            idle = self._exports_idle.wait_for(
+                lambda: self._active_exports == 0, timeout=self.shutdown_timeout
+            )
+            if not idle:
+                logger.warning(
+                    "Span export still running after %.0fs; leaving the exporter open",
+                    self.shutdown_timeout,
+                )
+                return
+            self._exporter_closed = True
+        try:
+            self.exporter.shutdown()
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
     # Internal
     def _worker_loop(self) -> None:
@@ -138,6 +161,10 @@ class BatchSpanProcessor(SpanProcessor):
         if self.exporter is None:
             return
 
+        with self._exports_idle:
+            if self._exporter_closed:
+                return
+            self._active_exports += 1
         try:
             # Export spans - exporter will handle conversion if needed
             self.exporter.export(list(spans))
@@ -146,3 +173,7 @@ class BatchSpanProcessor(SpanProcessor):
             import traceback
             traceback.print_exc()
             return
+        finally:
+            with self._exports_idle:
+                self._active_exports -= 1
+                self._exports_idle.notify_all()

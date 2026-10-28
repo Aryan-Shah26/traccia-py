@@ -1,5 +1,7 @@
 """Tests for the batching span processor (TRC-278)."""
 
+import threading
+
 from traccia.processors.batch_processor import BatchSpanProcessor
 from traccia.tracer import TracerProvider
 from traccia.tracer.provider import SpanProcessor
@@ -103,3 +105,58 @@ def test_shutdown_exports_then_shuts_down_exporter_once():
     provider.shutdown()
 
     assert exporter.events == [("export", ["work"]), ("shutdown", [])]
+
+
+class _BlockingExporter:
+    """Export blocks until released, like a slow network export."""
+
+    def __init__(self):
+        self.events = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def export(self, spans):
+        self.events.append("export started")
+        self.started.set()
+        self.release.wait(timeout=10)
+        self.events.append("export finished")
+        return True
+
+    def shutdown(self):
+        self.events.append("exporter shutdown")
+
+
+def _shutdown_during_worker_export(exporter, **kwargs):
+    # A short delay makes shutdown's timed worker join() give up while the export runs.
+    batch = BatchSpanProcessor(exporter, schedule_delay_millis=10, **kwargs)
+    span = _PendingSpan("work")
+    span._ended = True
+    batch.on_end(span)
+    assert exporter.started.wait(timeout=5)
+
+    stopper = threading.Thread(target=batch.shutdown)
+    stopper.start()
+    stopper.join(timeout=0.3)
+    return stopper
+
+
+def test_shutdown_waits_for_an_active_export_before_closing_the_exporter():
+    exporter = _BlockingExporter()
+    stopper = _shutdown_during_worker_export(exporter)
+
+    assert stopper.is_alive()
+    assert exporter.events == ["export started"]
+
+    exporter.release.set()
+    stopper.join(timeout=5)
+    assert not stopper.is_alive()
+    assert exporter.events == ["export started", "export finished", "exporter shutdown"]
+
+
+def test_shutdown_leaves_the_exporter_open_when_an_export_outlasts_the_timeout():
+    exporter = _BlockingExporter()
+    stopper = _shutdown_during_worker_export(exporter, shutdown_timeout_millis=100)
+
+    assert not stopper.is_alive()
+    exporter.release.set()
+    assert "exporter shutdown" not in exporter.events
